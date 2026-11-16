@@ -8,7 +8,7 @@ now so later sprints only add features, not schema changes.
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 ROLES = ("buyer_tenant", "owner", "advocate", "admin")
 PROPERTY_TYPES = ("Apartment", "House", "Duplex", "Studio", "Plot", "Commercial")
@@ -257,8 +257,26 @@ CREATE TABLE search_history (
 CREATE INDEX search_history_user ON search_history(user_id, searched_at);
 """
 
+# Version 3: advocates can apply for an account themselves. The admin sends an
+# appointment, meets the advocate in person and then verifies or rejects them.
+# Advocates added by the admin (and all older accounts) are 'verified' from the start.
+ADVOCATE_VERIFICATION_SCHEMA = """
+ALTER TABLE advocate_profiles ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'verified'
+    CHECK (verification_status IN ('pending', 'appointment_sent', 'verified', 'rejected'));
+-- Appointment date and time as Bangladesh local time, 'YYYY-MM-DDTHH:MM'.
+ALTER TABLE advocate_profiles ADD COLUMN appointment_at TEXT;
+ALTER TABLE advocate_profiles ADD COLUMN appointment_place TEXT;
+ALTER TABLE advocate_profiles ADD COLUMN admin_message TEXT;
+ALTER TABLE advocate_profiles ADD COLUMN reviewed_by INTEGER REFERENCES users(id);
+ALTER TABLE advocate_profiles ADD COLUMN reviewed_at TEXT;
+"""
+
 # Steps that bring an older database up to date, keyed by the version they start from.
-MIGRATIONS = {1: HISTORY_SCHEMA}
+MIGRATIONS = {1: HISTORY_SCHEMA, 2: ADVOCATE_VERIFICATION_SCHEMA}
+
+# Signed-in user rows carry advocate_status (NULL for every role except advocate).
+USER_SELECT = """SELECT u.*, ap.verification_status AS advocate_status
+                 FROM users u LEFT JOIN advocate_profiles ap ON ap.user_id = u.id"""
 
 
 def utc_now():
@@ -285,7 +303,7 @@ def initialize(path):
         if version == 0:
             # The default journal mode is used on purpose: WAL is not safe on the
             # network drives that hosting services such as PythonAnywhere use.
-            connection.executescript(SCHEMA + HISTORY_SCHEMA)
+            connection.executescript(SCHEMA + HISTORY_SCHEMA + ADVOCATE_VERIFICATION_SCHEMA)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
             return True

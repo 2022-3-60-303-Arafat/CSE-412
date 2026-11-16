@@ -18,11 +18,16 @@ USERS = [
     ("tenant2", "Sumaiya Islam", "tenant2@pfb.test", "01710000008", "buyer_tenant"),
     ("advocate", "Adv. Sarah Rahman", "advocate@pfb.test", "01710000005", "advocate"),
     ("advocate2", "Adv. Mahmud Karim", "advocate2@pfb.test", "01710000006", "advocate"),
+    ("applicant", "Adv. Imran Hossain", "applicant@pfb.test", "01710000009", "advocate"),
 ]
 
 ADVOCATES = {
     "advocate": ("DBC-2016-0412", "Land and property documents"),
     "advocate2": ("DBC-2018-1187", "Rental agreements and title review"),
+}
+# Applied through the advocate sign-up page; waiting for the admin to send an appointment.
+ADVOCATE_APPLICANTS = {
+    "applicant": ("DBC-2022-0731", "Property transfer and registration"),
 }
 
 # key, owner, listing type, title, area, city, address, type, amount, beds, baths, sqft, furnished, photo, description, rent extras
@@ -155,12 +160,12 @@ def seed(connection, upload_dir):
     def at(days_ago, hours=0):
         return (now - timedelta(days=days_ago, hours=hours)).isoformat(timespec="seconds")
 
-    password_hash = hash_password(DEMO_PASSWORD)
     users = {}
     for key, name, email, phone, role in USERS:
         cursor = connection.execute(
             "INSERT INTO users (full_name, email, phone, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (name, email, phone, password_hash, role, at(30)),
+            # Hashed separately for each account, so every account gets its own salt.
+            (name, email, phone, hash_password(DEMO_PASSWORD), role, at(30)),
         )
         users[key] = cursor.lastrowid
     for key, (bar_id, specialization) in ADVOCATES.items():
@@ -169,6 +174,13 @@ def seed(connection, upload_dir):
             (users[key], bar_id, specialization, users["admin"], at(29)),
         )
         audit(connection, users["admin"], "advocate_added", "user", users[key], None, "active", "Demo data")
+    for key, (bar_id, specialization) in ADVOCATE_APPLICANTS.items():
+        connection.execute(
+            """INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_at, verification_status)
+               VALUES (?, ?, ?, ?, 'pending')""",
+            (users[key], bar_id, specialization, at(2)),
+        )
+        audit(connection, users[key], "advocate_applied", "user", users[key], None, "pending", "Demo data")
 
     properties = {}
     for index, (key, owner, kind, title, area, city, address, ptype, amount, beds, baths, sqft, furnished, photo, desc, rent) in enumerate(LISTINGS):

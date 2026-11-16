@@ -6,6 +6,9 @@
   <meta name="description" content="Property Finder Bangladesh: find homes to buy or rent, with advocate-verified legal papers.">
   <title>Property Finder Bangladesh</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&display=swap">
   <link rel="stylesheet" href="css/app.css">
   <script type="module" src="js/app.js"></script>
 </head>
@@ -14,7 +17,9 @@
   <header class="site-header">
     <div class="header-inner">
       <a class="brand" href="#/" aria-label="Property Finder Bangladesh home">
-        <span class="brand-mark" aria-hidden="true">P</span>
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 36 36"><rect width="36" height="36" rx="10" fill="#0b6b4f"/><path d="M9 18.5 18 10l9 8.5V27h-5.6v-5.6h-6.8V27H9z" fill="#fff"/><circle cx="18" cy="17.2" r="2.4" fill="#d8362f"/></svg>
+        </span>
         <span class="brand-text">Property Finder <b>Bangladesh</b></span>
       </a>
       <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">Menu</button>
@@ -23,8 +28,42 @@
   </header>
   <main id="main" tabindex="-1"></main>
   <footer class="site-footer">
-    <p>Property Finder Bangladesh &middot; CSE412 Section 07, Group 08 &middot; Sprint 1 and Sprint 2 build</p>
-    <p class="muted">Demo project. Legal checks shown here are sample data, not real legal advice.</p>
+    <div class="wrap">
+      <div class="footer-grid">
+        <div>
+          <a class="brand" href="#/">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 36 36"><rect width="36" height="36" rx="10" fill="#0b6b4f"/><path d="M9 18.5 18 10l9 8.5V27h-5.6v-5.6h-6.8V27H9z" fill="#fff"/><circle cx="18" cy="17.2" r="2.4" fill="#d8362f"/></svg>
+            </span>
+            <span class="brand-text">Property Finder <b>Bangladesh</b></span>
+          </a>
+          <p>Homes to buy and rent across Bangladesh, with legal papers checked by an advocate.</p>
+        </div>
+        <div>
+          <h3>Explore</h3>
+          <ul>
+            <li><a href="#/">Find homes</a></li>
+            <li><a href="#/?purpose=sale">Homes for sale</a></li>
+            <li><a href="#/?purpose=rent">Homes for rent</a></li>
+            <li><a href="#/?verified=1">Verified homes</a></li>
+            <li><a href="#/calculator">Calculators</a></li>
+          </ul>
+        </div>
+        <div>
+          <h3>Owners and advocates</h3>
+          <ul>
+            <li><a href="#/owner/listings/new">List your property</a></li>
+            <li><a href="#/advocate/signup">Apply as an advocate</a></li>
+            <li><a href="#/login">Log in</a></li>
+            <li><a href="#/signup">Create an account</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-foot">
+        <p>Property Finder Bangladesh &middot; CSE412 Section 07, Group 08</p>
+        <p>Demo project. Legal checks shown here are sample data, not real legal advice.</p>
+      </div>
+    </div>
   </footer>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <noscript><p class="noscript">This site needs JavaScript turned on.</p></noscript>

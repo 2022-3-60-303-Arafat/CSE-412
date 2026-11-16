@@ -43,9 +43,16 @@ export const DOCUMENT_LABELS = {
   land_deed: 'Land deed', mutation: 'Mutation paper', tax_receipt: 'Tax receipt', ownership_history: 'Ownership history',
 };
 export const REVIEW_STATUS = { not_checked: 'Not checked', ok: 'OK', problem: 'Problem' };
+// An advocate who applied is verified by the admin after an in-person meeting.
+export const ADVOCATE_STATUS = {
+  pending: 'Waiting for appointment', appointment_sent: 'Appointment sent', verified: 'Verified', rejected: 'Rejected',
+};
 export const ACTION_LABELS = {
   account_created: 'Account created',
   advocate_added: 'Advocate added',
+  advocate_applied: 'Advocate applied',
+  advocate_appointment_sent: 'Advocate appointment sent',
+  advocate_verification_changed: 'Advocate verification changed',
   account_status_changed: 'Account status changed',
   listing_created: 'Listing created',
   listing_updated: 'Listing updated',
@@ -58,7 +65,7 @@ export const ACTION_LABELS = {
 };
 
 const statusText = value => REQUEST_STATUS[value] || PROPERTY_STATUS[value] || LISTING_STATUS[value]
-  || DOCUMENT_LABELS[value] || ROLE_LABELS[value] || REVIEW_STATUS[value] || value;
+  || DOCUMENT_LABELS[value] || ROLE_LABELS[value] || REVIEW_STATUS[value] || ADVOCATE_STATUS[value] || value;
 export const describeValue = value => (value ? statusText(value) : '');
 
 export function badge(status, text) {

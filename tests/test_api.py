@@ -246,6 +246,111 @@ class Sprint1Tests(ApiTestCase):
         self.assertNotIn("newadv@example.com", emails)
         self.assertEqual(Client(self.base).post("/api/auth/login", {"email": "newadv@example.com", "password": "Start1234"})[0], 401)
 
+    def advocate_application(self, **overrides):
+        data = {
+            "fullName": "Adv. Self Signup", "email": "selfadv@example.com", "phone": "01911111113",
+            "password": "Start1234", "barCouncilId": "DBC-2023-0099", "specialization": "Land",
+        }
+        data.update(overrides)
+        return data
+
+    def test_advocate_applies_gets_appointment_and_is_verified_in_person(self):
+        advocate = self.client()
+        status, body = advocate.post("/api/auth/advocate-signup", self.advocate_application())
+        self.assertEqual(status, 201, body)
+        self.assertEqual((body["user"]["role"], body["user"]["advocateStatus"]), ("advocate", "pending"))
+        advocate_id = body["user"]["id"]
+
+        # Until the admin verifies them, the advocate has no advocate powers.
+        self.assertEqual(advocate.get("/api/advocate/queue")[0], 403)
+        pending_request = self.request_id("Easy, airy living by the lake")
+        self.assertEqual(advocate.get(f"/api/verification-requests/{pending_request}")[0], 403)
+        self.assertEqual(advocate.post(f"/api/verification-requests/{pending_request}/start-review")[0], 403)
+        issue_listing = self.property_id("A family home with room to grow")
+        self.assertEqual(advocate.get(f"/api/properties/{issue_listing}")[1]["verificationStatus"], "unverified")
+        status, body = advocate.get("/api/advocate/application")
+        self.assertEqual((status, body["application"]["advocateStatus"], body["application"]["appointment"]), (200, "pending", None))
+
+        admin = self.client("admin@pfb.test")
+        listed = {a["email"]: a["advocateStatus"] for a in admin.get("/api/admin/advocates")[1]["advocates"]}
+        self.assertEqual(listed["selfadv@example.com"], "pending")
+        self.assertEqual(listed["advocate@pfb.test"], "verified")
+        # No verification without an appointment first.
+        self.assertEqual(admin.post(f"/api/admin/advocates/{advocate_id}/verification", {"decision": "verified"})[0], 409)
+        status, body = admin.post(f"/api/admin/advocates/{advocate_id}/appointment", {"appointmentAt": "2020-01-01T10:00", "place": ""})
+        self.assertEqual(status, 400)
+        self.assertEqual(set(body["fields"]), {"appointmentAt", "place"})
+        when = (date.today() + timedelta(days=3)).isoformat() + "T10:30"
+        status, body = admin.post(f"/api/admin/advocates/{advocate_id}/appointment", {
+            "appointmentAt": when, "place": "PFB office, Road 5, Dhanmondi", "message": "Bring your Bar Council certificate.",
+        })
+        self.assertEqual((status, body["advocate"]["advocateStatus"]), (200, "appointment_sent"), body)
+
+        # The advocate sees the appointment message after logging in again.
+        advocate = self.client()
+        advocate.login("selfadv@example.com", "Start1234")
+        application = advocate.get("/api/advocate/application")[1]["application"]
+        self.assertEqual(application["appointment"], {"at": when, "place": "PFB office, Road 5, Dhanmondi"})
+        self.assertEqual(application["adminMessage"], "Bring your Bar Council certificate.")
+        self.assertEqual(advocate.get("/api/advocate/queue")[0], 403)
+
+        status, body = admin.post(f"/api/admin/advocates/{advocate_id}/verification", {"decision": "verified"})
+        self.assertEqual((status, body["advocate"]["advocateStatus"]), (200, "verified"), body)
+        self.assertEqual(advocate.get("/api/auth/me")[1]["user"]["advocateStatus"], "verified")
+        self.assertEqual(advocate.get("/api/advocate/queue")[0], 200)
+        self.assertEqual(admin.post(f"/api/admin/advocates/{advocate_id}/verification", {"decision": "rejected", "note": "Too late"})[0], 409)
+        with self.db() as connection:
+            actions = [row[0] for row in connection.execute(
+                "SELECT action_type FROM audit_log WHERE target_type = 'user' AND target_id = ? ORDER BY id", (advocate_id,))]
+        self.assertEqual(actions, ["advocate_applied", "advocate_appointment_sent", "advocate_verification_changed"])
+
+    def test_advocate_application_can_be_rejected_and_is_admin_only(self):
+        advocate = self.client()
+        status, body = advocate.post("/api/auth/advocate-signup", self.advocate_application())
+        advocate_id = body["user"]["id"]
+        # Only the admin can send appointments or decide; an applicant cannot verify themselves.
+        for client in (advocate, self.client("owner@pfb.test"), self.client("advocate@pfb.test")):
+            self.assertEqual(client.post(f"/api/admin/advocates/{advocate_id}/verification", {"decision": "verified"})[0], 403)
+            self.assertEqual(client.post(f"/api/admin/advocates/{advocate_id}/appointment", {})[0], 403)
+        self.assertEqual(self.client("tenant@pfb.test").get("/api/advocate/application")[0], 403)
+
+        admin = self.client("admin@pfb.test")
+        status, body = admin.post(f"/api/admin/advocates/{advocate_id}/verification", {"decision": "rejected"})
+        self.assertEqual(status, 400)
+        self.assertIn("note", body["fields"])
+        status, body = admin.post(f"/api/admin/advocates/{advocate_id}/verification",
+                                  {"decision": "rejected", "note": "Bar Council ID could not be confirmed."})
+        self.assertEqual((status, body["advocate"]["advocateStatus"]), (200, "rejected"))
+        application = advocate.get("/api/advocate/application")[1]["application"]
+        self.assertEqual((application["advocateStatus"], application["adminMessage"]),
+                         ("rejected", "Bar Council ID could not be confirmed."))
+        self.assertEqual(advocate.get("/api/advocate/queue")[0], 403)
+
+    def test_advocate_signup_errors_and_duplicates(self):
+        status, body = self.client().post("/api/auth/advocate-signup", {"fullName": "A", "email": "bad", "phone": "1", "password": "x"})
+        self.assertEqual(status, 400)
+        self.assertEqual(set(body["fields"]), {"fullName", "email", "phone", "password", "barCouncilId", "specialization"})
+        status, body = self.client().post("/api/auth/advocate-signup",
+                                          self.advocate_application(email="advocate@pfb.test", barCouncilId="DBC-2016-0412"))
+        self.assertEqual(status, 409)
+        self.assertEqual(set(body["fields"]), {"email", "barCouncilId"})
+        # The demo applicant is waiting and cannot use the queue.
+        applicant = self.client("applicant@pfb.test")
+        self.assertEqual(applicant.get("/api/auth/me")[1]["user"]["advocateStatus"], "pending")
+        self.assertEqual(applicant.get("/api/advocate/queue")[0], 403)
+
+    def test_passwords_are_stored_hashed_with_a_salt_per_account(self):
+        self.client().post("/api/auth/signup", {
+            "fullName": "New Tenant", "email": "new@example.com", "phone": "01812345678",
+            "password": DEMO_PASSWORD, "role": "buyer_tenant",
+        })
+        with self.db() as connection:
+            hashes = [row[0] for row in connection.execute("SELECT password_hash FROM users")]
+        self.assertEqual(len(set(hashes)), len(hashes))  # same password, different stored value
+        for stored in hashes:
+            self.assertTrue(stored.startswith("pbkdf2_sha256$"))
+            self.assertNotIn(DEMO_PASSWORD, stored)
+
     def test_pb04_duplicate_bar_council_id_rejected(self):
         status, body = self.client("admin@pfb.test").post("/api/admin/advocates", {
             "fullName": "Adv. Copy", "email": "copy@example.com", "phone": "01911111112",
@@ -253,6 +358,23 @@ class Sprint1Tests(ApiTestCase):
         })
         self.assertEqual(status, 409)
         self.assertIn("barCouncilId", body["fields"])
+
+    def test_pb05_description_is_optional(self):
+        owner = self.client("owner@pfb.test")
+        for description in (None, "", "   "):
+            listing = rent_listing(description=description)
+            if description is None:
+                del listing["description"]
+            status, body = owner.post("/api/properties", listing)
+            self.assertEqual(status, 201, body)
+            self.assertEqual(body["property"]["description"], "")
+        listing_id = body["property"]["id"]
+        status, body = owner.put(f"/api/properties/{listing_id}", rent_listing(description="Short note"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["property"]["description"], "Short note")
+        status, body = owner.post("/api/properties", rent_listing(description="x" * 2001))
+        self.assertEqual(status, 400)
+        self.assertIn("description", body["fields"])
 
     def test_pb05_pb06_pb09_rent_listing_saved_live_and_unverified(self):
         owner = self.client("owner@pfb.test")
@@ -578,6 +700,22 @@ class BrowsingHistoryTests(ApiTestCase):
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertTrue({"property_views", "search_history"} <= tables)
         self.assertEqual(version, db.SCHEMA_VERSION)
+
+    def test_old_database_keeps_its_advocates_verified(self):
+        old = Path(self.temp.name) / "old.sqlite3"
+        connection = sqlite3.connect(old)
+        connection.executescript(db.SCHEMA + db.HISTORY_SCHEMA)
+        connection.execute("INSERT INTO users (full_name, email, phone, password_hash, role, created_at) "
+                           "VALUES ('Adv. Old', 'old@example.com', '01711111111', 'x', 'advocate', '2026-01-01')")
+        connection.execute("INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_at) "
+                           "VALUES (1, 'DBC-1', 'Land', '2026-01-01')")
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+        connection.close()
+        self.assertFalse(db.initialize(old))
+        with contextlib.closing(sqlite3.connect(old)) as connection:
+            self.assertEqual(connection.execute("SELECT verification_status FROM advocate_profiles").fetchone()[0], "verified")
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
 
 
 class WsgiHostingTests(ApiTestCase):

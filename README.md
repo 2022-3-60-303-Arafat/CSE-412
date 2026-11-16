@@ -33,6 +33,7 @@ All demo accounts use the password **`Demo@1234`**. The login page also lists th
 | Owner (second, third) | `owner2@pfb.test`, `owner3@pfb.test` | Show that one owner cannot change another owner's listings |
 | Advocate | `advocate@pfb.test` | Verification queue, checklist, decisions |
 | Advocate (second) | `advocate2@pfb.test` | Has one review in progress; shows that a review belongs to one advocate only |
+| Advocate (applied) | `applicant@pfb.test` | Signed up as an advocate and is waiting for an appointment; cannot open the queue yet |
 | Admin | `admin@pfb.test` | Advocates, high-demand areas, all requests, audit log |
 
 ## The database
@@ -53,7 +54,21 @@ How browsing history works:
 - The admin panel has a **Browsing activity** tab: total views, most viewed listings, most searched areas, latest views and searches.
 - Privacy: guests are counted without any personal details, and no IP addresses are stored. Opening the same listing again within 30 minutes is not counted twice. Views by the listing's own owner, advocates and admins are not counted. Clearing history unlinks the views from the person but keeps the listing's view count.
 
-An older database is upgraded automatically on start-up (schema version 1 to 2); no reset is needed.
+An older database is upgraded automatically on start-up (schema version 1 or 2 to 3); no reset is needed. Advocates already in an older database stay verified.
+
+## Advocate sign-up and in-person verification
+
+Advocates can apply for an account themselves instead of waiting for the admin to create one.
+
+1. **Apply.** On the **Create an account** page the advocate picks **Work as an advocate** (the third account type, next to Buy or rent and Sell or rent out; `#/advocate/signup` opens the page with it already chosen) and enters name, email, mobile number, Bar Council ID, specialization and a password. The account is created as an advocate with the status **Waiting for appointment**.
+2. **Appointment.** In the Admin panel → **Advocates**, the application appears under **Advocate applications**. The admin clicks **Send appointment** and enters a date and time, a place and an optional message.
+3. **Message.** The advocate logs in on the normal Log in page and sees the appointment and the admin's message on **My application**. No email or SMS is sent; the message is shown inside the site.
+4. **In person.** The advocate comes to the appointment. After checking them, the admin clicks **Mark verified in person** (or **Reject** with a reason, which the advocate sees).
+5. **Access.** Only a verified advocate can open the verification queue, requests and legal papers. The server checks this on every request, not just the menu.
+
+The status is stored in `advocate_profiles` (`verification_status`, `appointment_at`, `appointment_place`, `admin_message`, `reviewed_by`, `reviewed_at`), and each step is written to the audit log. **Add an advocate** in the admin panel still creates an account that is verified at once, for advocates the admin has already met.
+
+Demo: log in as `applicant@pfb.test` to see a waiting application, then as `admin@pfb.test` to send the appointment and verify.
 
 ## Put it online for free (PythonAnywhere)
 
@@ -84,7 +99,7 @@ This gives the site a free address, `https://YOURNAME.pythonanywhere.com`, that 
 6. **Start it.** Click the green **Reload** button at the top of the Web tab, then open `https://YOURNAME.pythonanywhere.com`.
 
 Good to know:
-- **Keep it alive:** on the free plan, log in once every 3 months and click **Run until 3 months from today** on the Web tab, or the site is paused.
+- **Keep it alive:** on the free plan, log in at least once a month and click the **Run until ...** extend button on the Web tab, or the site is paused. (Since January 2026 free web apps expire after 1 month, not 3.)
 - **Updating the site:** upload the changed files (or a new zip), then click **Reload** on the Web tab. Your database is kept unless you run `--reset` again.
 - **If something goes wrong:** the **Error log** link on the Web tab shows what happened.
 - **Custom domain:** the free plan only allows the `pythonanywhere.com` address. A custom domain such as `pfb.com.bd` needs a paid plan and a bought domain.
@@ -96,16 +111,16 @@ Good to know:
 python -m unittest discover -s tests -v
 ```
 
-There are 31 automated tests: at least one per story's acceptance criteria, 5 for browsing history and 2 for the hosted version. Set `PFB_TEST_WSGI=1` to run all of them against the hosted (WSGI) version. Each test starts its own server on a temporary database, so your demo data is never touched.
+There are 37 automated tests: at least one per story's acceptance criteria, 5 for browsing history, 4 for advocate sign-up and verification, and 2 for the hosted version. Set `PFB_TEST_WSGI=1` to run all of them against the hosted (WSGI) version. Each test starts its own server on a temporary database, so your demo data is never touched.
 
 ## Where each story is done
 
 | Story | What was built | Main code |
 |---|---|---|
 | PB-01 | Tables for all new classes (RentDetails, VerificationRequest, LegalDocument, VerificationReport, AuditLog, Consultation, ChatMessage, Payment, RentAgreement), linked to `properties` and `users`. Demo data: 38 sample listings across all eight divisions and all six property types (apartments, houses, duplexes, studios, plots, commercial spaces). | `pfb/db.py`, `pfb/seed.py` |
-| PB-02 | Four roles. The role is saved at sign up (Buyer/Tenant or Owner); advocates are added by the admin. The menu changes by role. Every API call checks the role on the server, and the browser shows "not available" on another role's page. | `pfb/api.py`, `public/js/app.js` |
+| PB-02 | Four roles. The role is saved at sign up (Buyer/Tenant or Owner); advocates apply on their own page or are added by the admin. The menu changes by role. Every API call checks the role on the server, and the browser shows "not available" on another role's page. | `pfb/api.py`, `public/js/app.js` |
 | PB-03 | Only the owner can edit or delete a listing. Any attempt to set `verificationStatus` from the listing form is refused; only advocate decisions change it. | `owned_property`, `reject_verification_fields` in `pfb/api.py` |
-| PB-04 | Admin adds advocates (with Bar Council ID), blocks, unblocks and removes them. Blocking signs the advocate out and returns their open reviews to the queue. | Admin panel → Advocates |
+| PB-04 | Admin adds advocates (with Bar Council ID), blocks, unblocks and removes them, and verifies advocates who applied themselves after an in-person appointment. Blocking signs the advocate out and returns their open reviews to the queue. | Admin panel → Advocates |
 | PB-05 | Sell / Rent out choice on the listing form. Rent listings save monthly rent, deposit, available-from date, minimum lease, utilities and tenant preference. Wrong values show a message next to the field. | `pfb/validation.py`, `public/js/views/owner.js` |
 | PB-06 | The listing page shows rent, deposit and **move-in cost = first rent + deposit**. | `public/js/views/property.js` |
 | PB-07 | Search by All / Buy / Rent, area or city, type, min-max price (the labels switch to rent per month), bedrooms and sort. A friendly message shows when nothing matches. | `search_properties`, `public/js/views/home.js` |
@@ -158,7 +173,7 @@ instance/            database and uploaded papers (created at run time, not in g
 
 ## Security notes
 
-- Passwords are hashed with PBKDF2-SHA256. Sessions use a random token in an HttpOnly, SameSite cookie, and only a hash of the token is stored.
+- Passwords are never stored as plain text. Each one is hashed with PBKDF2-SHA256 (240,000 rounds) and its own random salt, so two accounts with the same password have different stored values and the password cannot be read back from the database. Sessions use a random token in an HttpOnly, SameSite cookie, and only a hash of the token is stored.
 - Five wrong passwords in 10 minutes lock that email from that computer for a while.
 - Every POST, PUT and DELETE must carry an `X-PFB-Request` header. This blocks cross-site form attacks.
 - The page HTML is built with an escaping template helper. A strict Content-Security-Policy and other security headers are sent on every response.

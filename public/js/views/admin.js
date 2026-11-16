@@ -2,7 +2,7 @@
 
 import { api } from '../api.js';
 import {
-  $, ACTION_LABELS, REQUEST_STATUS, ROLE_LABELS, badge, confirmClick, describeValue, formatDate, html, mount, submitting, toast,
+  $, ACTION_LABELS, ADVOCATE_STATUS, REQUEST_STATUS, ROLE_LABELS, badge, confirmClick, describeValue, formatDate, html, mount, submitting, toast,
 } from '../ui.js';
 import { describeFilters } from './buyer.js';
 
@@ -14,9 +14,64 @@ const TABS = [
   ['audit', 'Audit log'],
 ];
 
+// Advocates who applied themselves: send an appointment, then verify them after the in-person meeting.
+function applicationsPanel(applications) {
+  if (!applications.length) return '';
+  return html`
+    <div class="panel">
+      <div class="panel-title"><h2>Advocate applications</h2><span class="muted small">${applications.length} waiting</span></div>
+      <p class="muted small">These advocates signed up themselves. Send an appointment, meet them in person and check their Bar Council
+        certificate, then mark them verified. They cannot open the verification queue before that.</p>
+      ${applications.map(applicant => html`
+        <div class="application">
+          <div class="application-head">
+            <div><strong>${applicant.fullName}</strong>
+              <span class="sub">${applicant.email} · ${applicant.phone} · applied ${formatDate(applicant.createdAt)}</span>
+              <span class="sub">Bar Council ID ${applicant.barCouncilId} · ${applicant.specialization}</span></div>
+            ${badge(`advocate-${applicant.advocateStatus}`, ADVOCATE_STATUS[applicant.advocateStatus])}
+          </div>
+          ${applicant.appointment && applicant.advocateStatus === 'appointment_sent' ? html`
+            <p class="small"><strong>Appointment:</strong> ${formatDate(applicant.appointment.at, true)} at ${applicant.appointment.place}</p>` : ''}
+          ${applicant.adminMessage ? html`<p class="small"><strong>Your message:</strong> ${applicant.adminMessage}</p>` : ''}
+          <div class="application-actions">
+            <details>
+              <summary class="btn btn-outline btn-small">${applicant.advocateStatus === 'appointment_sent' ? 'Change appointment' : 'Send appointment'}</summary>
+              <form class="appointment-form" data-applicant="${applicant.id}" novalidate>
+                <p class="form-error notice notice-error" hidden></p>
+                <div class="form-grid">
+                  <label class="field"><span>Date and time <span class="hint">Bangladesh time</span></span>
+                    <input name="appointmentAt" type="datetime-local" value="${applicant.appointment?.at || ''}"></label>
+                  <label class="field"><span>Place</span>
+                    <input name="place" maxlength="160" value="${applicant.appointment?.place || ''}" placeholder="e.g. PFB office, House 12, Road 5, Dhanmondi"></label>
+                  <label class="field full"><span>Message to the advocate <span class="hint">optional</span></span>
+                    <textarea name="message" maxlength="500" placeholder="e.g. Please bring your Bar Council certificate and national ID."></textarea></label>
+                </div>
+                <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Send appointment</button></div>
+              </form>
+            </details>
+            <details>
+              <summary class="btn btn-outline btn-small">Reject</summary>
+              <form class="reject-form" data-applicant="${applicant.id}" novalidate>
+                <p class="form-error notice notice-error" hidden></p>
+                <label class="field"><span>Reason <span class="hint">the advocate will see this</span></span>
+                  <textarea name="note" maxlength="500"></textarea></label>
+                <div class="form-actions"><button class="btn btn-danger btn-small" type="submit">Reject application</button></div>
+              </form>
+            </details>
+            ${applicant.advocateStatus === 'appointment_sent' ? html`
+              <button class="btn btn-primary btn-small" type="button" data-verify="${applicant.id}">Mark verified in person</button>` : ''}
+            <button class="btn btn-danger btn-small" type="button" data-remove="${applicant.id}">Remove</button>
+          </div>
+        </div>`)}
+    </div>`;
+}
+
 async function advocatesTab(container, refresh) {
-  const { advocates } = await api.get('/api/admin/advocates');
+  const { advocates: everyone } = await api.get('/api/admin/advocates');
+  const advocates = everyone.filter(advocate => advocate.advocateStatus === 'verified');
+  const applications = everyone.filter(advocate => advocate.advocateStatus !== 'verified');
   mount(container, html`
+    ${applicationsPanel(applications)}
     <div class="panel">
       <div class="panel-title"><h2>Advocate panel</h2><span class="muted small">${advocates.length} advocates</span></div>
       ${advocates.length ? html`<div class="table-wrap"><table class="data">
@@ -32,11 +87,12 @@ async function advocatesTab(container, refresh) {
               ${advocate.accountStatus === 'active' ? 'Block' : 'Unblock'}</button>
             <button class="btn btn-danger btn-small" type="button" data-remove="${advocate.id}">Remove</button>
           </div></td>
-        </tr>`)}</tbody></table></div>` : html`<div class="empty"><h3>No advocates yet</h3><p>Add the first advocate below.</p></div>`}
+        </tr>`)}</tbody></table></div>` : html`<div class="empty"><h3>No verified advocates yet</h3><p>Verify an application above or add an advocate below.</p></div>`}
       <p class="small muted">Blocking or removing an advocate signs them out and returns their open reviews to the queue.</p>
     </div>
     <form class="panel" id="advocate-form" novalidate>
       <h2>Add an advocate</h2>
+      <p class="muted small">Use this for an advocate you have already checked in person. The account is verified at once.</p>
       <p class="form-error notice notice-error" hidden></p>
       <div class="form-grid">
         <label class="field"><span>Full name</span><input name="fullName" placeholder="Adv. Full Name"></label>
@@ -58,9 +114,41 @@ async function advocatesTab(container, refresh) {
       refresh();
     });
   });
+  container.addEventListener('submit', event => {
+    const appointmentForm = event.target.closest('.appointment-form');
+    const rejectForm = event.target.closest('.reject-form');
+    if (!appointmentForm && !rejectForm) return;
+    event.preventDefault();
+    const form = appointmentForm || rejectForm;
+    const id = form.dataset.applicant;
+    submitting(form, async () => {
+      if (appointmentForm) {
+        await api.post(`/api/admin/advocates/${id}/appointment`, Object.fromEntries(new FormData(form)));
+        toast('Appointment sent. The advocate will see it when they log in.');
+      } else {
+        await api.post(`/api/admin/advocates/${id}/verification`, { decision: 'rejected', note: form.note.value });
+        toast('Application rejected.');
+      }
+      refresh();
+    });
+  });
   container.addEventListener('click', async event => {
     const statusButton = event.target.closest('[data-status]');
     const removeButton = event.target.closest('[data-remove]');
+    const verifyButton = event.target.closest('[data-verify]');
+    if (verifyButton) {
+      if (!confirmClick(verifyButton, 'Confirm: met in person')) return;
+      verifyButton.disabled = true;
+      try {
+        await api.post(`/api/admin/advocates/${verifyButton.dataset.verify}/verification`, { decision: 'verified' });
+        toast('Advocate verified. They can now use the verification queue.');
+        refresh();
+      } catch (error) {
+        toast(error.message, true);
+        verifyButton.disabled = false;
+      }
+      return;
+    }
     try {
       if (statusButton) {
         statusButton.disabled = true;
