@@ -5,6 +5,7 @@ import {
   $, ACTION_LABELS, ADVOCATE_STATUS, AGREEMENT_STATUS, REQUEST_STATUS, ROLE_LABELS, badge, taka, confirmClick, describeValue, formatDate, html, mount, submitting, toast,
 } from '../ui.js';
 import { describeFilters } from './buyer.js';
+import { duplicatesTab, priceGuideReport } from './sprint5.js';
 
 const TABS = [
   ['report', 'Platform report'],
@@ -13,6 +14,7 @@ const TABS = [
   ['areas', 'High-demand areas'],
   ['activity', 'Browsing activity'],
   ['reports', 'Listing reports'],
+  ['duplicates', 'Duplicate listings'],
   ['audit', 'Audit log'],
 ];
 
@@ -352,6 +354,10 @@ async function reportTab(container, refresh) {
         <li><small>For sale</small><strong>${listings.sale}</strong></li>
         <li><small>For rent</small><strong>${listings.rent}</strong></li>
         <li><small>Open listing reports</small><strong>${report.listingReports.open}</strong></li>
+        <li><small>Possible duplicates</small><strong>${report.duplicateFlags.open}</strong>
+          <span class="sub"><a href="#/admin?tab=duplicates">Check them</a></span></li>
+        <li><small>Site visits booked</small><strong>${report.siteVisits.requested + report.siteVisits.confirmed}</strong>
+          <span class="sub">${report.siteVisits.confirmed} confirmed</span></li>
       </ul>
       <div class="share-bar" role="img" aria-label="${share(listings.verified, listings.active)}% of active listings are verified">
         <span style="width: ${share(listings.verified, listings.active)}%"></span></div>
@@ -400,7 +406,8 @@ async function reportTab(container, refresh) {
       <div class="panel"><div class="panel-title"><h3>Rent agreements</h3></div>
         <table class="data"><tbody>${Object.entries(report.agreements).map(([status, count]) => html`
           <tr><td>${AGREEMENT_STATUS[status]}</td><td class="num">${count}</td></tr>`)}</tbody></table></div>
-    </div>`);
+    </div>
+    ${priceGuideReport(report.priceGuide)}`);
 }
 
 // PB-30: reports of fake or wrong listings. The admin dismisses them or removes the listing.
@@ -449,7 +456,7 @@ async function listingReportsTab(container, refresh, query) {
 
 const RENDERERS = {
   report: reportTab, advocates: advocatesTab, requests: requestsTab, areas: areasTab, activity: activityTab,
-  reports: listingReportsTab, audit: auditTab,
+  reports: listingReportsTab, duplicates: duplicatesTab, audit: auditTab,
 };
 
 export async function render({ root, query, navigate }) {

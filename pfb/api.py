@@ -26,8 +26,9 @@ from .security import (
     token_digest,
     verify_password,
 )
+from .places import LANDMARKS_BY_ID, LATITUDE_RANGE, LONGITUDE_RANGE
 from .validation import CITIES, Checker, check_email, check_new_password, check_phone, clean_listing
-from .web import SESSION_COOKIE, ApiError, Response, Router, accepts_upload
+from .web import AVATAR_URL_PREFIX, SESSION_COOKIE, ApiError, Response, Router, accepts_upload
 
 router = Router()
 
@@ -51,12 +52,12 @@ HIGH_DEMAND_SQL = """EXISTS (SELECT 1 FROM high_demand_areas h
     WHERE lower(p.area_name) = lower(h.area_name) OR lower(p.area_name) LIKE lower(h.area_name) || ' %')"""
 
 PROPERTY_SELECT = """
-SELECT p.*, u.full_name AS owner_name,
+SELECT p.*, u.full_name AS owner_name, u.phone_verified_at AS owner_phone_verified_at, u.avatar_path AS owner_avatar_path,
        rd.monthly_rent, rd.security_deposit, rd.available_from, rd.min_lease_months,
        rd.utilities_included, rd.tenant_preference,
        CASE WHEN p.listing_type = 'rent' THEN rd.monthly_rent ELSE p.price END AS amount,
        (SELECT i.image_url FROM property_images i WHERE i.property_id = p.id
-        ORDER BY i.is_primary DESC, i.id LIMIT 1) AS primary_image
+        ORDER BY i.is_cover DESC, i.id LIMIT 1) AS primary_image
 FROM properties p
 JOIN users u ON u.id = p.owner_id
 LEFT JOIN rent_details rd ON rd.property_id = p.id
@@ -75,6 +76,8 @@ def user_json(row):
         "role": row["role"],
         "accountStatus": row["account_status"],
         "createdAt": row["created_at"],
+        "phoneVerified": bool(row["phone_verified_at"]),
+        "avatarUrl": AVATAR_URL_PREFIX + row["avatar_path"] if row["avatar_path"] else None,
     }
     if row["role"] == "advocate":
         data["advocateStatus"] = row["advocate_status"]
@@ -113,12 +116,17 @@ def property_json(row, viewer=None):
         "verificationStatus": status,
         "badgeLevel": row["badge_level"],
         "image": row["primary_image"],
-        "owner": {"id": row["owner_id"], "name": row["owner_name"]},
+        "owner": {"id": row["owner_id"], "name": row["owner_name"], "phoneVerified": bool(row["owner_phone_verified_at"]),
+                  "avatarUrl": AVATAR_URL_PREFIX + row["owner_avatar_path"] if row["owner_avatar_path"] else None},
+        "latitude": row["latitude"],
+        "longitude": row["longitude"],
         "isOwner": is_owner,
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "rent": None,
     }
+    if "distance_km" in row.keys() and row["distance_km"] is not None:
+        data["distanceKm"] = round(row["distance_km"], 1)
     if row["listing_type"] == "rent" and row["monthly_rent"] is not None:
         data["rent"] = {
             "monthlyRent": row["monthly_rent"],
@@ -354,7 +362,9 @@ def me(request):
 
 # ---------------------------------------------------------------- browsing history
 
-SEARCH_FILTER_KEYS = ("purpose", "area", "type", "minPrice", "maxPrice", "bedrooms", "verified")
+SEARCH_FILTER_KEYS = ("purpose", "area", "city", "type", "minPrice", "maxPrice", "bedrooms", "furnished", "verified",
+                      "near", "radius")
+SEARCH_PAGE_SIZE = 12
 VIEW_SOURCES = ("search", "favorites", "history", "direct")
 HISTORY_ROLES = ("buyer_tenant", "owner")
 # Opening the same listing again (or repeating a search) within this time is not saved twice.
@@ -507,8 +517,11 @@ def admin_activity(request):
     }
 
 
-@router.route("GET", "/api/properties")
-def search_properties(request):
+def search_conditions(request):
+    """Check the search filters and build the SQL for them. Shared by the result pages and the map (PB-37).
+
+    Returns (select, where, params, order, filters, near). `near` is the point distances are measured from, or None.
+    """
     query = request.query
     checker = Checker(query)
     purpose = checker.choice("purpose", "Listing type", ("sale", "rent", "any"), required=False, default="any")
@@ -516,13 +529,41 @@ def search_properties(request):
     min_price = checker.integer("minPrice", "Minimum price", 0, 10**12, required=False)
     max_price = checker.integer("maxPrice", "Maximum price", 0, 10**12, required=False)
     bedrooms = checker.integer("bedrooms", "Bedrooms", 0, 20, required=False)
-    sort = checker.choice("sort", "Sort order", ("recommended", "newest", "price_asc", "price_desc"), required=False, default="recommended")
+    city = checker.choice("city", "District", CITIES, required=False)
+    furnished = checker.choice("furnished", "Furnished", ("yes", "no"), required=False)
+    radius = checker.choice("radius", "Distance", ("1", "3", "5", "10"), required=False, default="5")
+    near = None
+    if query.get("near"):
+        landmark = LANDMARKS_BY_ID.get(query["near"])
+        if landmark is None:
+            checker.fail("near", "Choose a place from the list.")
+        else:
+            near = {"lat": landmark["lat"], "lng": landmark["lng"], "name": landmark["name"], "radiusKm": int(radius or 5)}
+    elif query.get("lat") or query.get("lng"):
+        # "Use my location": the browser sends the point. It is used for this search only and never saved.
+        try:
+            lat, lng = float(query.get("lat", "")), float(query.get("lng", ""))
+            if not (LATITUDE_RANGE[0] <= lat <= LATITUDE_RANGE[1] and LONGITUDE_RANGE[0] <= lng <= LONGITUDE_RANGE[1]):
+                raise ValueError
+            near = {"lat": lat, "lng": lng, "name": "Your location", "radiusKm": int(radius or 5)}
+        except ValueError:
+            checker.fail("near", "Your location is outside Bangladesh or could not be read.")
+    sorts = ("recommended", "newest", "price_asc", "price_desc", "distance")
+    sort = checker.choice("sort", "Sort order", sorts, required=False, default="distance" if near else "recommended")
+    if sort == "distance" and near is None:
+        checker.fail("sort", "Choose a place to sort by distance.")
     if min_price is not None and max_price is not None and min_price > max_price:
         checker.fail("maxPrice", "Maximum price must be higher than the minimum price.")
     checker.done("Please check the search filters.")
 
+    if near:
+        select = PROPERTY_SELECT.replace(
+            "FROM properties p", ", distance_km(p.latitude, p.longitude, ?, ?) AS distance_km\nFROM properties p", 1)
+        params = [near["lat"], near["lng"]]
+    else:
+        select = PROPERTY_SELECT.replace("FROM properties p", ", NULL AS distance_km\nFROM properties p", 1)
+        params = []
     where = ["p.listing_status = 'active'"]
-    params = []
     if purpose in ("sale", "rent"):
         where.append("p.listing_type = ?")
         params.append(purpose)
@@ -531,9 +572,15 @@ def search_properties(request):
         pattern = "%" + area.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         where.append("(p.area_name LIKE ? ESCAPE '\\' OR p.city LIKE ? ESCAPE '\\' OR p.address LIKE ? ESCAPE '\\')")
         params += [pattern, pattern, pattern]
+    if city:
+        where.append("p.city = ?")
+        params.append(city)
     if property_type:
         where.append("p.property_type = ?")
         params.append(property_type)
+    if furnished:
+        where.append("p.furnished = ?")
+        params.append(1 if furnished == "yes" else 0)
     if min_price is not None:
         where.append("amount >= ?")
         params.append(min_price)
@@ -545,21 +592,51 @@ def search_properties(request):
         params.append(bedrooms)
     if query.get("verified") in ("1", "true"):
         where.append("p.verification_status = 'document_verified'")
+    if near:
+        where.append("distance_km IS NOT NULL AND distance_km <= ?")
+        params.append(near["radiusKm"])
 
     order = {
         "recommended": "(p.verification_status = 'document_verified') DESC, p.created_at DESC, p.id DESC",
         "newest": "p.created_at DESC, p.id DESC",
         "price_asc": "amount ASC, p.id",
         "price_desc": "amount DESC, p.id",
+        "distance": "distance_km ASC, p.id",
     }[sort]
-    rows = request.connection.execute(
-        PROPERTY_SELECT + " WHERE " + " AND ".join(where) + " ORDER BY " + order + " LIMIT 200", params
-    ).fetchall()
     filters = {key: str(query[key]).strip()[:60] for key in SEARCH_FILTER_KEYS if str(query.get(key, "")).strip()}
     if filters.get("purpose") == "any":
         del filters["purpose"]
-    record_search(request, filters, len(rows))
-    return {"properties": [property_json(row, request.user) for row in rows], "total": len(rows)}
+    if not query.get("near"):
+        filters.pop("radius", None)   # a distance means nothing without a place
+    return select, where, params, order, filters, near
+
+
+@router.route("GET", "/api/properties")
+def search_properties(request):
+    select, where, params, order, filters, near = search_conditions(request)
+    page = Checker(request.query).integer("page", "Page", 1, 100_000, required=False)
+    if page is None and request.query.get("page") not in (None, ""):
+        raise ApiError(400, "Please check the search filters.", {"page": "Page must be a whole number from 1 to 100000."})
+    page = page or 1
+    matching = select + " WHERE " + " AND ".join(where)
+    total = request.connection.execute(f"SELECT COUNT(*) FROM ({matching})", params).fetchone()[0]
+    # 12 homes per page. A page past the end shows the last page instead of nothing.
+    pages = max(1, -(-total // SEARCH_PAGE_SIZE))
+    page = min(page, pages)
+    rows = request.connection.execute(
+        matching + " ORDER BY " + order + " LIMIT ? OFFSET ?", (*params, SEARCH_PAGE_SIZE, (page - 1) * SEARCH_PAGE_SIZE)
+    ).fetchall()
+    # Turning to another page is the same search, so only the first page is saved in the history.
+    if page == 1:
+        record_search(request, filters, total)
+    return {
+        "properties": [property_json(row, request.user) for row in rows],
+        "total": total,
+        "page": page,
+        "pages": pages,
+        "pageSize": SEARCH_PAGE_SIZE,
+        "near": near,
+    }
 
 
 @router.route("GET", "/api/properties/{id}")
@@ -573,12 +650,8 @@ def get_property(request):
     if not visible:
         raise ApiError(404, "This listing does not exist or has been removed.")
     data = property_json(row, viewer)
-    data["images"] = [
-        {"url": image["image_url"], "caption": image["caption"]}
-        for image in request.connection.execute(
-            "SELECT * FROM property_images WHERE property_id = ? ORDER BY is_primary DESC, id", (row["id"],)
-        )
-    ]
+    data["images"] = photos.list_images(request.connection, row["id"])
+    data["priceGuide"] = sprint5.price_position(request.connection, row)
     if viewer is not None and viewer["role"] == "buyer_tenant":
         data["isFavorite"] = request.connection.execute(
             "SELECT 1 FROM favorites WHERE user_id = ? AND property_id = ?", (viewer["id"], row["id"])
@@ -641,9 +714,11 @@ def reject_verification_fields(data):
 @router.route("POST", "/api/properties")
 def create_property(request):
     user = request.require("owner")
+    sprint5.require_confirmed_phone(user)
     data = request.json()
     reject_verification_fields(data)
     listing, rent = clean_listing(data)
+    sprint5.clean_location(data)   # a wrong map pin is refused before anything is saved
     connection = request.connection
     now = utc_now()
     # PB-09: the listing goes live at once and starts as 'unverified'.
@@ -660,6 +735,8 @@ def create_property(request):
     property_id = cursor.lastrowid
     if rent:
         save_rent_details(connection, property_id, rent)
+    sprint5.save_location(connection, property_id, data, listing)
+    sprint5.check_duplicate_text(connection, property_id)
     audit(connection, user["id"], "listing_created", "property", property_id, None, "active / unverified", listing["title"])
 
     request_id = None
@@ -703,6 +780,9 @@ def update_property(request):
         save_rent_details(connection, row["id"], rent)
     else:
         connection.execute("DELETE FROM rent_details WHERE property_id = ?", (row["id"],))
+    sprint5.save_location(connection, row["id"], data, listing, row)
+    if "description" in changed:
+        sprint5.check_duplicate_text(connection, row["id"])
     if changed:
         audit(connection, user["id"], "listing_updated", "property", row["id"], None, None, "Changed: " + ", ".join(changed))
     if listing_status != row["listing_status"]:
@@ -1464,4 +1544,4 @@ def admin_audit_log(request):
 
 
 # Sprint 3 routes register themselves on the router above. Imported last because consult.py uses the helpers here.
-from . import consult, sprint4  # noqa: E402, F401
+from . import consult, photos, profile, sprint4, sprint5  # noqa: E402, F401

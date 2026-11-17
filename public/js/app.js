@@ -1,7 +1,7 @@
 // Entry point: session, role-based menu (PB-02) and hash routing.
 
 import { api } from './api.js';
-import { $, ROLE_LABELS, errorPanel, html, loading, mount, toast } from './ui.js';
+import { $, ROLE_LABELS, avatar, errorPanel, html, loading, mount, toast } from './ui.js';
 import * as home from './views/home.js';
 import * as property from './views/property.js';
 import * as auth from './views/auth.js';
@@ -12,6 +12,9 @@ import * as review from './views/review.js';
 import * as admin from './views/admin.js';
 import * as consult from './views/consult.js';
 import * as agreements from './views/agreements.js';
+import * as sprint5 from './views/sprint5.js';
+import * as profile from './views/profile.js';
+import { languageSwitch, setUpLanguage } from './i18n.js';
 
 export const session = { user: null, meta: { cities: [], propertyTypes: [], areas: [], documentTypes: [] } };
 
@@ -40,17 +43,29 @@ const routes = [
   { path: '/agreements', view: agreements.renderList, roles: ['owner', 'buyer_tenant', 'advocate', 'admin'], verifiedOnly: true },
   { path: '/agreements/new', view: agreements.renderNew, roles: ['owner'] },
   { path: '/agreements/:id', view: agreements.renderDetail, roles: ['owner', 'buyer_tenant', 'advocate', 'admin'], verifiedOnly: true },
+  { path: '/visits', view: sprint5.renderVisits, roles: ['buyer_tenant', 'owner'] },
+  { path: '/profile', view: profile.render, roles: ['buyer_tenant', 'owner', 'advocate', 'admin'] },
+  { path: '/compare', view: sprint5.renderCompare },
+  { path: '/price-guide', view: sprint5.renderPriceGuide },
   { path: '/admin', view: admin.render, roles: ['admin'] },
   { path: '/admin/requests/:id', view: review.renderRequest, roles: ['admin'] },
 ];
 
 const MENUS = {
-  guest: [['/', 'Find homes'], ['/calculator', 'Calculators']],
-  buyer_tenant: [['/', 'Find homes'], ['/favorites', 'Saved'], ['/inquiries', 'Inquiries'], ['/consultations', 'Consultations'], ['/agreements', 'Agreements'], ['/history', 'History'], ['/calculator', 'Calculators']],
-  owner: [['/', 'Find homes'], ['/owner/listings', 'My listings'], ['/inquiries', 'Inquiries'], ['/agreements', 'Agreements'], ['/history', 'History'], ['/calculator', 'Calculators']],
+  guest: [['/', 'Find homes'], ['/price-guide', 'Price guide'], ['/calculator', 'Calculators']],
+  buyer_tenant: [['/', 'Find homes'], ['/favorites', 'Saved'], ['/visits', 'Visits'], ['/inquiries', 'Inquiries'], ['/consultations', 'Consultations'], ['/agreements', 'Agreements']],
+  owner: [['/', 'Find homes'], ['/owner/listings', 'My listings'], ['/visits', 'Visits'], ['/inquiries', 'Inquiries'], ['/agreements', 'Agreements']],
   advocate: [['/advocate', 'Verification queue'], ['/consultations', 'Consultations'], ['/agreements', 'Agreements'], ['/', 'Browse listings']],
   advocate_unverified: [['/advocate/application', 'My application'], ['/', 'Browse listings']],
   admin: [['/admin', 'Admin panel'], ['/', 'Browse listings']],
+};
+
+// Links in the profile menu (under the picture in the header), so the main menu fits on one line.
+const PROFILE_LINKS = {
+  buyer_tenant: [['/history', 'History'], ['/calculator', 'Calculators'], ['/price-guide', 'Price guide']],
+  owner: [['/history', 'History'], ['/calculator', 'Calculators'], ['/price-guide', 'Price guide']],
+  advocate: [],
+  admin: [],
 };
 
 const HOME_FOR_ROLE = { buyer_tenant: '/', owner: '/owner/listings', advocate: '/advocate', admin: '/admin' };
@@ -87,15 +102,26 @@ function renderNav(path) {
   mount(nav, html`
     ${links.map(([href, label]) => html`<a href="#${href}" class="${path === href ? 'active' : ''}">${label}</a>`)}
     <span class="nav-spacer"></span>
+    ${languageSwitch()}
     ${user ? html`
       <a class="bell ${path === '/notifications' ? 'active' : ''}" href="#/notifications" aria-label="Notifications" title="Notifications">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 7 2.5 7h-17S6 15 6 9z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>
         <span class="bell-count" id="bell-count" hidden></span>
       </a>
-      <span class="nav-user">
-        <span class="who">${user.fullName}<small>${ROLE_LABELS[user.role]}${isUnverifiedAdvocate(user) ? ' (not verified)' : ''}</small></span>
-        <button class="btn btn-outline btn-small" type="button" data-logout>Log out</button>
-      </span>` : html`
+      <div class="profile-menu">
+        <button class="profile-toggle ${path === '/profile' ? 'active' : ''}" type="button" id="profile-toggle" aria-haspopup="true"
+          aria-expanded="false" aria-controls="profile-dropdown" title="${user.fullName}">
+          ${avatar(user, 'small')}<span class="profile-name">${user.fullName.replace(/^Adv\.?\s+/i, '').split(' ')[0]}</span>
+          <span class="caret" aria-hidden="true">&#9662;</span>
+        </button>
+        <div class="profile-dropdown" id="profile-dropdown" hidden>
+          <div class="profile-dropdown-head">${avatar(user, 'medium')}
+            <div><strong>${user.fullName}</strong><small>${ROLE_LABELS[user.role]}${isUnverifiedAdvocate(user) ? ' (not verified)' : ''}</small></div></div>
+          <a href="#/profile">My profile</a>
+          ${(isUnverifiedAdvocate(user) ? [] : PROFILE_LINKS[user.role]).map(([href, label]) => html`<a href="#${href}">${label}</a>`)}
+          <button type="button" class="logout" data-logout>Log out</button>
+        </div>
+      </div>` : html`
       <a href="#/login" class="${path === '/login' ? 'active' : ''}">Log in</a>
       <a class="btn btn-primary btn-small" href="#/signup">Sign up</a>`}
   `);
@@ -137,6 +163,7 @@ export async function route() {
   renderNav(path);
   showBell();
   updateBell();
+  sprint5.updateCompareBar();
   $('#site-nav').classList.remove('open');
   $('.menu-toggle').setAttribute('aria-expanded', 'false');
 
@@ -184,7 +211,24 @@ export async function refreshSession() {
   return user;
 }
 
+function closeProfileMenu() {
+  const dropdown = $('#profile-dropdown');
+  if (!dropdown || dropdown.hidden) return;
+  dropdown.hidden = true;
+  $('#profile-toggle')?.setAttribute('aria-expanded', 'false');
+}
+
+document.addEventListener('keydown', event => { if (event.key === 'Escape') closeProfileMenu(); });
+
 document.addEventListener('click', async event => {
+  const toggle = event.target.closest('#profile-toggle');
+  if (toggle) {
+    const dropdown = $('#profile-dropdown');
+    dropdown.hidden = !dropdown.hidden;
+    toggle.setAttribute('aria-expanded', String(!dropdown.hidden));
+    return;
+  }
+  if (!event.target.closest('#profile-dropdown') || event.target.closest('a')) closeProfileMenu();
   if (event.target.closest('[data-logout]')) {
     try {
       await api.post('/api/auth/logout');
@@ -203,6 +247,7 @@ $('.menu-toggle').addEventListener('click', event => {
 });
 
 window.addEventListener('hashchange', route);
+setUpLanguage();   // PB-42: Bangla / English
 
 async function start() {
   try {

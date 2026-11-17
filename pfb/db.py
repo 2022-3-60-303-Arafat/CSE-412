@@ -5,10 +5,11 @@ classes (consultations, chat, payments, reports, rent agreements) are created
 now so later sprints only add features, not schema changes.
 """
 
+import math
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 
 ROLES = ("buyer_tenant", "owner", "advocate", "admin")
 PROPERTY_TYPES = ("Apartment", "House", "Duplex", "Studio", "Plot", "Commercial")
@@ -323,8 +324,110 @@ CREATE TABLE listing_reports (
 CREATE INDEX listing_reports_status ON listing_reports(status, property_id);
 """
 
+# Version 6: owners upload photos of their listings. A photo uploaded by an owner has a file_path
+# (relative to the photo folder); the demo photos are links to a photo service and have none.
+# A listing has at most one cover photo, which search cards show.
+PHOTOS_SCHEMA = """
+ALTER TABLE property_images RENAME COLUMN is_primary TO is_cover;
+ALTER TABLE property_images ADD COLUMN file_path TEXT;
+UPDATE property_images SET is_cover = 0
+    WHERE is_cover = 1 AND id NOT IN (SELECT MIN(id) FROM property_images WHERE is_cover = 1 GROUP BY property_id);
+CREATE UNIQUE INDEX property_images_one_cover ON property_images(property_id) WHERE is_cover = 1;
+"""
+
+# Version 7 (Sprint 5, PB-34 to PB-43): site visits, phone confirmation, wallet receipts, map positions,
+# duplicate-listing flags, advocate reviews and monthly rent payments.
+SPRINT5_SCHEMA = """
+CREATE TABLE site_visits (
+    id            INTEGER PRIMARY KEY,
+    property_id   INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    tenant_id     INTEGER NOT NULL REFERENCES users(id),
+    owner_id      INTEGER NOT NULL REFERENCES users(id),
+    slot_start    TEXT NOT NULL,
+    note          TEXT,
+    status        TEXT NOT NULL DEFAULT 'requested' CHECK (status IN ('requested', 'confirmed', 'declined', 'cancelled')),
+    owner_reply   TEXT,
+    created_at    TEXT NOT NULL,
+    responded_at  TEXT
+);
+-- A time slot of a listing can be held by one open visit only.
+CREATE UNIQUE INDEX site_visits_slot ON site_visits(property_id, slot_start) WHERE status IN ('requested', 'confirmed');
+CREATE INDEX site_visits_tenant ON site_visits(tenant_id, status);
+CREATE INDEX site_visits_owner ON site_visits(owner_id, status);
+
+ALTER TABLE users ADD COLUMN phone_verified_at TEXT;
+-- Owners who already had listings before this step keep publishing.
+UPDATE users SET phone_verified_at = created_at WHERE role = 'owner'
+    AND EXISTS (SELECT 1 FROM properties p WHERE p.owner_id = users.id);
+CREATE TABLE phone_verifications (
+    id           INTEGER PRIMARY KEY,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    phone        TEXT NOT NULL,
+    code_hash    TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    verified_at  TEXT
+);
+CREATE INDEX phone_verifications_user ON phone_verifications(user_id, id);
+
+ALTER TABLE payments ADD COLUMN account_masked TEXT;
+
+ALTER TABLE properties ADD COLUMN latitude REAL;
+ALTER TABLE properties ADD COLUMN longitude REAL;
+
+ALTER TABLE property_images ADD COLUMN file_hash TEXT;
+CREATE INDEX property_images_hash ON property_images(file_hash) WHERE file_hash IS NOT NULL;
+CREATE TABLE duplicate_flags (
+    id                   INTEGER PRIMARY KEY,
+    property_id          INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    matched_property_id  INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    kind                 TEXT NOT NULL CHECK (kind IN ('photo', 'text')),
+    similarity           INTEGER NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'dismissed', 'removed')),
+    resolved_by          INTEGER REFERENCES users(id),
+    resolved_at          TEXT,
+    created_at           TEXT NOT NULL,
+    UNIQUE (property_id, matched_property_id, kind)
+);
+CREATE INDEX duplicate_flags_status ON duplicate_flags(status);
+
+CREATE TABLE reviews (
+    id               INTEGER PRIMARY KEY,
+    consultation_id  INTEGER NOT NULL UNIQUE REFERENCES consultations(id) ON DELETE CASCADE,
+    advocate_id      INTEGER NOT NULL REFERENCES users(id),
+    client_id        INTEGER NOT NULL REFERENCES users(id),
+    rating           INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment          TEXT,
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX reviews_advocate ON reviews(advocate_id);
+
+CREATE TABLE rent_payments (
+    id                INTEGER PRIMARY KEY,
+    agreement_id      INTEGER NOT NULL REFERENCES rent_agreements(id) ON DELETE CASCADE,
+    due_date          TEXT NOT NULL,
+    amount            INTEGER NOT NULL CHECK (amount > 0),
+    status            TEXT NOT NULL DEFAULT 'due' CHECK (status IN ('due', 'marked_paid', 'confirmed')),
+    paid_note         TEXT,
+    marked_paid_at    TEXT,
+    confirmed_at      TEXT,
+    reminded_before   INTEGER NOT NULL DEFAULT 0 CHECK (reminded_before IN (0, 1)),
+    reminded_overdue  INTEGER NOT NULL DEFAULT 0 CHECK (reminded_overdue IN (0, 1)),
+    UNIQUE (agreement_id, due_date)
+);
+"""
+
+# Version 8: the profile page (profile picture, occupation and a short "about me").
+PROFILE_SCHEMA = """
+ALTER TABLE users ADD COLUMN avatar_path TEXT;
+ALTER TABLE users ADD COLUMN occupation TEXT;
+ALTER TABLE users ADD COLUMN bio TEXT;
+"""
+
 # Steps that bring an older database up to date, keyed by the version they start from.
-MIGRATIONS = {1: HISTORY_SCHEMA, 2: ADVOCATE_VERIFICATION_SCHEMA, 3: SPRINT3_SCHEMA, 4: SPRINT4_SCHEMA}
+MIGRATIONS = {1: HISTORY_SCHEMA, 2: ADVOCATE_VERIFICATION_SCHEMA, 3: SPRINT3_SCHEMA, 4: SPRINT4_SCHEMA, 5: PHOTOS_SCHEMA,
+              6: SPRINT5_SCHEMA, 7: PROFILE_SCHEMA}
 
 # Signed-in user rows carry advocate_status (NULL for every role except advocate).
 USER_SELECT = """SELECT u.*, ap.verification_status AS advocate_status
@@ -335,10 +438,21 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def distance_km(lat1, lng1, lat2, lng2):
+    """Straight-line distance in kilometres between two points (haversine). None if a point is missing."""
+    if None in (lat1, lng1, lat2, lng2):
+        return None
+    lat1, lng1, lat2, lng2 = map(math.radians, (lat1, lng1, lat2, lng2))
+    a = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lng2 - lng1) / 2) ** 2
+    return 6371.0 * 2 * math.asin(math.sqrt(a))
+
+
 def connect(path):
     connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    # PB-37: SQL can filter and sort listings by distance to a place.
+    connection.create_function("distance_km", 4, distance_km, deterministic=True)
     return connection
 
 
@@ -355,7 +469,8 @@ def initialize(path):
         if version == 0:
             # The default journal mode is used on purpose: WAL is not safe on the
             # network drives that hosting services such as PythonAnywhere use.
-            connection.executescript(SCHEMA + HISTORY_SCHEMA + ADVOCATE_VERIFICATION_SCHEMA + SPRINT3_SCHEMA + SPRINT4_SCHEMA)
+            connection.executescript(SCHEMA + HISTORY_SCHEMA + ADVOCATE_VERIFICATION_SCHEMA + SPRINT3_SCHEMA + SPRINT4_SCHEMA
+                                     + PHOTOS_SCHEMA + SPRINT5_SCHEMA + PROFILE_SCHEMA)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
             return True

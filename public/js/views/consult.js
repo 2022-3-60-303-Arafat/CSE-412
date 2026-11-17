@@ -4,6 +4,7 @@
 import { api } from '../api.js';
 import { updateBell } from '../app.js';
 import { $, CONSULT_STATE, badge, confirmClick, formatDate, html, mount, submitting, taka, toast } from '../ui.js';
+import { ratingLine, reviewPanel, setUpReview } from './sprint5.js';
 
 const POLL_MS = 8000;
 
@@ -128,7 +129,7 @@ function receiptPanel(receipt) {
     <ul class="fact-list">
       <li><small>Transaction</small><strong>${receipt.transactionRef}</strong></li>
       <li><small>Amount</small><strong>${taka(receipt.amount)}</strong></li>
-      <li><small>Method</small><strong>${receipt.method}</strong></li>
+      <li><small>Method</small><strong>${receipt.method}</strong>${receipt.account ? html`<span class="sub">${receipt.account}</span>` : ''}</li>
       <li><small>Paid on</small><strong>${formatDate(receipt.paidAt, true)}</strong></li>
     </ul>
   </div>`;
@@ -150,8 +151,10 @@ function clientActions(item) {
           <select name="method"><option value="bkash">bKash</option><option value="nagad">Nagad</option><option value="card">Card</option></select></label>
         <label class="field"><span id="account-label">bKash mobile number</span>
           <input name="account" inputmode="numeric" autocomplete="off" placeholder="01XXXXXXXXX"></label>
+        <label class="field" id="pin-field"><span id="pin-label">bKash PIN</span>
+          <input name="pin" type="password" inputmode="numeric" autocomplete="off" maxlength="5" placeholder="4 or 5 digits"></label>
       </div>
-      <p class="small muted">Demo payment: no real money is taken. A number that ends in 0000 shows what a failed payment looks like.</p>
+      <p class="small muted">Sandbox payment: no real money is taken and the PIN is never stored. A number that ends in 0000 shows what a failed payment looks like.</p>
       <div class="form-actions">
         <button class="btn btn-accent" type="submit">Pay ${taka(item.fee)}</button>
         <button class="btn btn-danger" type="button" data-cancel>Cancel booking</button>
@@ -229,6 +232,7 @@ export async function renderDetail({ root, params, session, navigate, isCurrent 
         ${isChat ? html`<div class="panel"><div class="panel-title"><h2>Messages</h2><span class="muted small">Free question</span></div><div id="chat"></div></div>` : html`
           ${isAdvocate ? advocateActions(item) : clientActions(item)}
           ${outcome(item)}
+          ${reviewPanel(item, user)}
           ${receiptPanel(item.receipt)}`}
       </div>
       <aside class="panel">
@@ -248,6 +252,7 @@ export async function renderDetail({ root, params, session, navigate, isCurrent 
     toast(message);
     navigate(`/consultations/${item.id}`);
   };
+  setUpReview(root, item, reopen);
   const act = async (button, path, body, message) => {
     button.disabled = true;
     try {
@@ -281,11 +286,14 @@ export async function renderDetail({ root, params, session, navigate, isCurrent 
     const card = payForm.method.value === 'card';
     $('#account-label', payForm).textContent = card ? 'Card number' : `${payForm.method.selectedOptions[0].textContent} mobile number`;
     payForm.account.placeholder = card ? '16 digits' : '01XXXXXXXXX';
+    // PB-36: bKash and Nagad ask for the wallet PIN; a card does not.
+    $('#pin-field', payForm).hidden = card;
+    $('#pin-label', payForm).textContent = `${payForm.method.selectedOptions[0].textContent} PIN`;
   });
   payForm?.addEventListener('submit', event => {
     event.preventDefault();
     submitting(payForm, async () => {
-      await api.post(`/api/consultations/${item.id}/pay`, { method: payForm.method.value, account: payForm.account.value });
+      await api.post(`/api/consultations/${item.id}/pay`, { method: payForm.method.value, account: payForm.account.value, pin: payForm.pin.value });
       reopen('Payment received. Your booking is confirmed.');
     });
   });
@@ -345,7 +353,7 @@ export async function renderBooking({ root, query, navigate, isCurrent }) {
         <div class="role-choice">
           ${advocates.map((advocate, index) => html`
             <label><input type="radio" name="advocateId" value="${advocate.id}" ${index === 0 ? html`checked` : ''}>
-              <span><strong>${advocate.name}</strong><small>${advocate.specialization}</small><small>Fee: ${taka(advocate.fee)}</small></span></label>`)}
+              <span><strong>${advocate.name}</strong><small>${advocate.specialization}</small><small>Fee: ${taka(advocate.fee)}</small>${ratingLine(advocate)}</span></label>`)}
         </div>
       </fieldset>
       <fieldset class="form-section" data-error-for="slotStart">

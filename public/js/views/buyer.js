@@ -9,11 +9,13 @@ export function describeFilters(filters) {
   const parts = [];
   if (filters.purpose) parts.push(filters.purpose === 'rent' ? 'For rent' : 'For sale');
   if (filters.area) parts.push(filters.area);
+  if (filters.city) parts.push(`${filters.city} district`);
   if (filters.type) parts.push(filters.type);
   if (filters.minPrice && filters.maxPrice) parts.push(`${taka(Number(filters.minPrice))} – ${taka(Number(filters.maxPrice))}`);
   else if (filters.minPrice) parts.push(`from ${taka(Number(filters.minPrice))}`);
   else if (filters.maxPrice) parts.push(`up to ${taka(Number(filters.maxPrice))}`);
   if (filters.bedrooms) parts.push(`${filters.bedrooms}+ bedrooms`);
+  if (filters.furnished) parts.push(filters.furnished === 'yes' ? 'furnished' : 'unfurnished');
   if (filters.verified) parts.push('verified only');
   return parts.join(' · ') || 'All homes';
 }

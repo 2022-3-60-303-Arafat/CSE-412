@@ -8,7 +8,9 @@ import logging
 from email.message import Message
 from http import HTTPStatus
 
-from .web import SECURITY_HEADERS, Response, dispatch_api, response_headers
+from .web import (
+    SECURITY_HEADERS, Response, discard_body, dispatch_api, is_upload_path, response_headers, upload_file,
+)
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -51,18 +53,24 @@ def make_wsgi_app(router, config):
         path = environ.get("PATH_INFO") or "/"
         query = environ.get("QUERY_STRING")
         if path.startswith("/api/"):
+            request_headers = environ_headers(environ)
             response = dispatch_api(
-                router, config, method, path + (f"?{query}" if query else ""), environ_headers(environ),
+                router, config, method, path + (f"?{query}" if query else ""), request_headers,
                 environ.get("REMOTE_ADDR", ""), environ["wsgi.input"].read, log.error,
             )
+            if response.unread_body:
+                discard_body(request_headers, environ["wsgi.input"].read)
             headers = response_headers(response)
         else:
             if method in ("GET", "HEAD"):
-                response = static_file(config.public_dir, path)
+                if is_upload_path(path):
+                    response = upload_file(config, path)
+                else:
+                    response = static_file(config.public_dir, path)
                 response = response or Response(404, body=b"Not found", content_type="text/plain; charset=utf-8")
             else:
                 response = Response(405, body=b"Method not allowed", content_type="text/plain; charset=utf-8")
-            headers = [("Content-Type", response.content_type), ("Content-Length", str(len(response.body)))]
+            headers = [("Content-Type", response.content_type), ("Content-Length", str(len(response.body))), *response.headers]
         headers += list(SECURITY_HEADERS.items())
         if config.secure_cookies:
             # Hosted over HTTPS: tell browsers to always use HTTPS for this site.

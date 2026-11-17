@@ -1,4 +1,4 @@
-"""Demo data so every Sprint 1 to 4 feature can be shown right after start-up."""
+"""Demo data so every Sprint 1 to 5 feature can be shown right after start-up."""
 
 import json
 import secrets
@@ -208,7 +208,7 @@ def seed(connection, upload_dir):
             )
         if photo:
             connection.execute(
-                "INSERT INTO property_images (property_id, image_url, caption, is_primary, uploaded_at) VALUES (?, ?, ?, 1, ?)",
+                "INSERT INTO property_images (property_id, image_url, caption, is_cover, uploaded_at) VALUES (?, ?, ?, 1, ?)",
                 (property_id, f"https://images.unsplash.com/{photo}?auto=format&fit=crop&w=1100&q=80", title, created),
             )
         audit(connection, users[owner], "listing_created", "property", property_id, None, "active / unverified", title)
@@ -309,6 +309,7 @@ def seed(connection, upload_dir):
     seed_browsing(connection, users, properties, at)
     seed_sprint3(connection, users, properties, at, now)
     seed_sprint4(connection, users, properties, at, now)
+    seed_sprint5(connection, users, properties, at, now)
 
 
 # Searches the demo tenants made (before the demo starts), for the History page.
@@ -509,3 +510,43 @@ def seed_sprint4(connection, users, properties, at, now):
         audit(connection, users[who], "listing_reported", "property", properties[key][0], None, reason, details)
     notify(connection, users["admin"], "listing_report", "A listing was reported",
            f"{properties['purbachal-plot'][2]}: The listing looks fake.", "/admin?tab=reports")
+
+
+def seed_sprint5(connection, users, properties, at, now):
+    """Phone confirmation, map positions and site visits (PB-34, PB-35, PB-37)."""
+    from .places import default_location
+
+    # The demo owners have confirmed their mobile numbers, so they can publish at once (PB-35).
+    connection.execute("UPDATE users SET phone_verified_at = ? WHERE role = 'owner'", (at(29),))
+
+    # Map positions: the area centre, spread a little so homes in the same area do not sit on one pin (PB-37).
+    rows = connection.execute("SELECT id, area_name, city FROM properties ORDER BY id").fetchall()
+    for index, row in enumerate(rows):
+        centre = default_location(row["area_name"], row["city"])
+        if centre:
+            spread = ((index * 37) % 11 - 5) * 0.0009, ((index * 53) % 11 - 5) * 0.0009
+            connection.execute("UPDATE properties SET latitude = ?, longitude = ? WHERE id = ?",
+                               (round(centre[0] + spread[0], 6), round(centre[1] + spread[1], 6), row["id"]))
+
+    # Site visits (PB-34): one waiting for the owner, one confirmed.
+    today = (now + timedelta(hours=6)).date()
+
+    def visit(tenant, key, days_ahead, hour, status, note, reply=None):
+        property_id, owner_key, title = properties[key]
+        slot = f"{(today + timedelta(days=days_ahead)).isoformat()}T{hour:02d}:00"
+        connection.execute(
+            """INSERT INTO site_visits (property_id, tenant_id, owner_id, slot_start, note, status, owner_reply, created_at, responded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (property_id, users[tenant], users[owner_key], slot, note, status, reply, at(1),
+             at(0, hours=5) if status != "requested" else None),
+        )
+        return owner_key, title, slot
+
+    owner_key, title, slot = visit("tenant", "banani", 2, 17, "requested",
+                                   "I work in Gulshan and would like to come after office.")
+    notify(connection, users[owner_key], "site_visit", "New visit request",
+           f"Rafi Chowdhury wants to see {title} on {slot.replace('T', ' at ')}.", "/visits")
+    _owner, title, slot = visit("tenant2", "uttara", 3, 11, "confirmed", "Coming with my parents.",
+                                reply="Please call when you reach the gate.")
+    notify(connection, users["tenant2"], "site_visit", "Your visit is confirmed",
+           f"You can see {title} on {slot.replace('T', ' at ')}.", "/visits")

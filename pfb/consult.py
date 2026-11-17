@@ -28,7 +28,8 @@ CONSULT_SELECT = """
 SELECT c.*, p.title AS property_title, p.area_name, p.city,
        cl.full_name AS client_name, cl.phone AS client_phone,
        ad.full_name AS advocate_name, ap.specialization,
-       pay.transaction_ref, pay.paid_at, pay.method AS paid_method, pay.amount AS paid_amount,
+       pay.transaction_ref, pay.paid_at, pay.method AS paid_method, pay.amount AS paid_amount, pay.account_masked,
+       rv.rating AS review_rating, rv.comment AS review_comment, rv.created_at AS review_created_at,
        (SELECT COUNT(*) FROM chat_messages m WHERE m.consultation_id = c.id) AS message_count,
        (SELECT MAX(m.sent_at) FROM chat_messages m WHERE m.consultation_id = c.id) AS last_message_at
 FROM consultations c
@@ -37,10 +38,13 @@ JOIN users ad ON ad.id = c.advocate_id
 LEFT JOIN advocate_profiles ap ON ap.user_id = c.advocate_id
 LEFT JOIN properties p ON p.id = c.property_id
 LEFT JOIN payments pay ON pay.consultation_id = c.id AND pay.status = 'paid'
+LEFT JOIN reviews rv ON rv.consultation_id = c.id
 """
 
 ADVOCATE_LIST_SQL = """
-SELECT u.id, u.full_name, ap.specialization, ap.consultation_fee
+SELECT u.id, u.full_name, ap.specialization, ap.consultation_fee,
+       (SELECT AVG(r.rating) FROM reviews r WHERE r.advocate_id = u.id) AS rating,
+       (SELECT COUNT(*) FROM reviews r WHERE r.advocate_id = u.id) AS review_count
 FROM users u JOIN advocate_profiles ap ON ap.user_id = u.id
 WHERE u.role = 'advocate' AND u.account_status = 'active' AND ap.verification_status = 'verified'
 """
@@ -75,12 +79,16 @@ def consult_json(row):
         "messageCount": row["message_count"],
         "lastMessageAt": row["last_message_at"],
         "receipt": None,
+        # PB-41: the client's rating after a completed consultation.
+        "review": {"rating": row["review_rating"], "comment": row["review_comment"], "createdAt": row["review_created_at"]}
+                  if row["review_rating"] is not None else None,
     }
     if row["transaction_ref"]:
         data["receipt"] = {
             "transactionRef": row["transaction_ref"],
             "amount": row["paid_amount"],
             "method": PAYMENT_METHODS.get(row["paid_method"], row["paid_method"]),
+            "account": row["account_masked"],
             "paidAt": row["paid_at"],
         }
     return data
@@ -176,7 +184,16 @@ def free_slots(connection, advocate_id):
 
 def advocate_json(row):
     return {"id": row["id"], "name": row["full_name"], "specialization": row["specialization"],
-            "fee": row["consultation_fee"] or DEFAULT_CONSULTATION_FEE}
+            "fee": row["consultation_fee"] or DEFAULT_CONSULTATION_FEE,
+            "rating": round(row["rating"], 1) if row["rating"] is not None else None, "reviewCount": row["review_count"]}
+
+
+def masked_account(method, account):
+    """What the receipt shows: 017*****678 for a wallet, **** 1234 for a card."""
+    if method == "card":
+        return "**** " + account[-4:]
+    wallet = account[-11:]
+    return wallet[:3] + "*****" + wallet[-3:]
 
 
 def add_message(connection, consultation, sender, body):
@@ -366,6 +383,9 @@ def pay_consultation(request):
             checker.fail("account", "Enter the 16-digit card number.")
     elif not PHONE_PATTERN.match(normalize_phone(account)):
         checker.fail("account", f"Enter the {PAYMENT_METHODS.get(method, 'wallet')} mobile number, such as 01712345678.")
+    elif method in ("bkash", "nagad") and not re.fullmatch(r"\d{4,5}", str(data.get("pin", ""))):
+        # PB-36: the wallet asks for its PIN, as bKash and Nagad do. Sandbox only: the PIN is checked for shape, never kept.
+        checker.fail("pin", f"Enter your {PAYMENT_METHODS[method]} PIN (4 or 5 digits).")
     checker.done()
 
     connection = request.connection
@@ -380,9 +400,9 @@ def pay_consultation(request):
                             "No money was taken. Check the number or try another method.")
     reference = "PFB-" + secrets.token_hex(5).upper()
     connection.execute(
-        """INSERT INTO payments (consultation_id, amount, method, status, transaction_ref, created_at, paid_at)
-           VALUES (?, ?, ?, 'paid', ?, ?, ?)""",
-        (row["id"], row["fee"], method, reference, now, now),
+        """INSERT INTO payments (consultation_id, amount, method, status, transaction_ref, created_at, paid_at, account_masked)
+           VALUES (?, ?, ?, 'paid', ?, ?, ?, ?)""",
+        (row["id"], row["fee"], method, reference, now, now, masked_account(method, account)),
     )
     notify(connection, row["advocate_id"], "consultation", "A consultation is booked and paid",
            f"{user['full_name']} paid for {nice_time(row['slot_start'])}.", f"/consultations/{row['id']}")
@@ -426,6 +446,8 @@ def cancel_consultation(request):
 def list_notifications(request):
     user = request.require()
     connection = request.connection
+    from .sprint5 import send_rent_reminders   # imported here: sprint5 is loaded after this module
+    send_rent_reminders(connection, user)   # PB-43: due and overdue rent reminders appear with the other notifications
     unread = connection.execute("SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0", (user["id"],)).fetchone()[0]
     if request.query.get("count") == "1":
         return {"unread": unread}

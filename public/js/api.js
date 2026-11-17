@@ -53,4 +53,16 @@ export const api = {
     `/api/verification-requests/${requestId}/documents?type=${encodeURIComponent(documentType)}&name=${encodeURIComponent(file.name)}`,
     { body: file, contentType: file.type || 'application/octet-stream' },
   ),
+  // Profile picture: one file, sent as the request body.
+  uploadAvatar: file => send(
+    'POST',
+    `/api/profile/avatar?name=${encodeURIComponent(file.name)}`,
+    { body: file, contentType: file.type || 'application/octet-stream' },
+  ),
+  // Listing photos: one file per request, like the legal papers.
+  uploadPhoto: (propertyId, file) => send(
+    'POST',
+    `/api/properties/${propertyId}/images?name=${encodeURIComponent(file.name)}`,
+    { body: file, contentType: file.type || 'application/octet-stream' },
+  ),
 };

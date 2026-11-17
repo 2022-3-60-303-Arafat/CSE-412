@@ -1,14 +1,41 @@
-// Home page: search with Sale/Rent, price or rent range, bedrooms and Verified-only filters (PB-07, PB-15).
+// Home page: search with Sale/Rent, area, district, price or rent range, bedrooms, furnished and Verified-only
+// filters (PB-07, PB-15), 12 homes per page. Every filter and the page are in the address, so a search can be shared.
 
 import { api } from '../api.js';
-import { $, errorPanel, html, mount, photo, priceLine, showErrors, taka, toast, verificationBadge, loading } from '../ui.js';
+import { $, errorPanel, html, mount, photo, priceLine, shortTaka, showErrors, taka, toast, verificationBadge, loading } from '../ui.js';
+import { askLocation, distanceLine, googleMap } from './sprint5.js';
 
-// Homes shown before the visitor asks for the rest, so the page does not start as one long list.
-const FIRST_PAGE = 12;
-const FILTER_KEYS =['purpose', 'area', 'type', 'minPrice', 'maxPrice', 'bedrooms', 'verified', 'sort'];
+const FILTER_KEYS = ['purpose', 'area', 'city', 'type', 'minPrice', 'maxPrice', 'bedrooms', 'furnished', 'verified', 'sort',
+  'near', 'radius', 'lat', 'lng'];
+// PB-37: places to search near (universities, offices, hospitals). Loaded once.
+let landmarks = null;
+
+// Page buttons: the first and last page, and the pages next to the current one, with gaps shown as "…".
+function pageList(page, pages) {
+  const wanted = [...new Set([1, page - 1, page, page + 1, pages])].filter(n => n >= 1 && n <= pages).sort((a, b) => a - b);
+  const list = [];
+  wanted.forEach((n, i) => {
+    if (i && n - wanted[i - 1] > 1) list.push('gap');
+    list.push(n);
+  });
+  return list;
+}
+
+function pager(page, pages) {
+  if (pages <= 1) return '';
+  return html`<nav class="pager" aria-label="Search result pages">
+    <button class="btn btn-outline btn-small" type="button" data-page="${page - 1}" ${page === 1 ? html`disabled` : ''}>&larr; Previous</button>
+    ${pageList(page, pages).map(n => (n === 'gap'
+    ? html`<span class="pager-gap" aria-hidden="true">…</span>`
+    : html`<button class="btn btn-small ${n === page ? 'btn-primary' : 'btn-outline'}" type="button" data-page="${n}"
+        aria-label="Page ${n}" ${n === page ? html`aria-current="page"` : ''}>${n}</button>`))}
+    <button class="btn btn-outline btn-small" type="button" data-page="${page + 1}" ${page === pages ? html`disabled` : ''}>Next &rarr;</button>
+  </nav>`;
+}
 
 // `source` records where the visitor found the listing (search, favorites, history) in the browsing history.
-export function propertyCard(property, source = 'search') {
+// `near` is the place of a near-me search, to say how far the home is.
+export function propertyCard(property, source = 'search', near = null) {
   return html`<a class="property-card" href="#/property/${property.id}?from=${source}">
     <div class="card-photo">
       ${photo(property, `${property.title} in ${property.areaName}`, 640)}
@@ -22,6 +49,7 @@ export function propertyCard(property, source = 'search') {
       ${property.rent ? html`<div class="card-sub">Deposit ${taka(property.rent.securityDeposit)} · Move-in ${taka(property.rent.moveInCost)}</div>` : ''}
       <h3 class="card-title">${property.title}</h3>
       <div class="card-sub">${property.areaName}, ${property.city}</div>
+      ${distanceLine(property, near)}
       <div class="card-facts">
         <span>${property.propertyType}</span>
         ${property.bedrooms ? html`<span>${property.bedrooms} bed</span>` : ''}
@@ -54,6 +82,18 @@ function rangeLabels(purpose) {
 export async function render({ root, query, session }) {
   const filters = Object.fromEntries(FILTER_KEYS.map(key => [key, query[key] || '']));
   filters.purpose ||= 'any';
+  filters.radius ||= '5';
+  let view = query.view === 'map' ? 'map' : 'list';
+  let locationProblem = '';   // why the visitor's location could not be read, shown above the map
+  if (!landmarks) {
+    try {
+      ({ landmarks } = await api.get('/api/landmarks'));
+    } catch {
+      landmarks = [];
+    }
+  }
+  const landmarkCities = [...new Set(landmarks.map(place => place.city))];
+  const firstPage = Math.max(1, Number.parseInt(query.page, 10) || 1);
   const [minLabel, maxLabel, minHint, maxHint] = rangeLabels(filters.purpose);
 
   const user = session.user;
@@ -85,9 +125,19 @@ export async function render({ root, query, session }) {
               ${session.meta.propertyTypes.map(type => html`<option ${filters.type === type ? html`selected` : ''}>${type}</option>`)}
             </select>
           </label>
+          <label class="field pill-field"><span>District</span>
+            <select name="city"><option value="">Any district</option>
+              ${session.meta.cities.map(city => html`<option ${filters.city === city ? html`selected` : ''}>${city}</option>`)}
+            </select>
+          </label>
           <label class="field pill-field"><span>Bedrooms</span>
             <select name="bedrooms">
               ${[['', 'Any'], ['1', '1+'], ['2', '2+'], ['3', '3+'], ['4', '4+']].map(([value, label]) => html`<option value="${value}" ${filters.bedrooms === value ? html`selected` : ''}>${label}</option>`)}
+            </select>
+          </label>
+          <label class="field pill-field"><span>Furnished</span>
+            <select name="furnished">
+              ${[['', 'Any'], ['yes', 'Furnished'], ['no', 'Unfurnished']].map(([value, label]) => html`<option value="${value}" ${filters.furnished === value ? html`selected` : ''}>${label}</option>`)}
             </select>
           </label>
           <label class="field pill-field"><span id="min-label">${minLabel}</span>
@@ -98,9 +148,21 @@ export async function render({ root, query, session }) {
           </label>
           <label class="field pill-field"><span>Sort by</span>
             <select name="sort" class="sort-select">
-              ${[['recommended', 'Verified first'], ['newest', 'Newest'], ['price_asc', 'Price: low to high'], ['price_desc', 'Price: high to low']].map(([value, label]) => html`<option value="${value}" ${filters.sort === value ? html`selected` : ''}>${label}</option>`)}
+              ${[['recommended', 'Verified first'], ['newest', 'Newest'], ['price_asc', 'Price: low to high'], ['price_desc', 'Price: high to low'], ['distance', 'Nearest first']].map(([value, label]) => html`<option value="${value}" ${filters.sort === value ? html`selected` : ''}>${label}</option>`)}
             </select>
           </label>
+          <label class="field pill-field"><span>Near a place</span>
+            <select name="near"><option value="">Anywhere</option>
+              ${filters.lat ? html`<option value="" selected>My location</option>` : ''}
+              ${landmarkCities.map(city => html`<optgroup label="${city}">${landmarks.filter(place => place.city === city).map(place => html`
+                <option value="${place.id}" ${filters.near === place.id ? html`selected` : ''}>${place.name}</option>`)}</optgroup>`)}
+            </select>
+          </label>
+          <label class="field pill-field"><span>Within</span>
+            <select name="radius">${['1', '3', '5', '10'].map(km => html`<option value="${km}" ${filters.radius === km ? html`selected` : ''}>${km} km</option>`)}</select>
+          </label>
+          <input type="hidden" name="lat" value="${filters.lat}"><input type="hidden" name="lng" value="${filters.lng}">
+          <button class="link-button" type="button" id="my-location">Use my location</button>
           <label class="pill-check"><input type="checkbox" name="verified" value="1" ${filters.verified ? html`checked` : ''}> Verified only</label>
           <button class="link-button" type="button" id="clear-search">Clear</button>
         </div>
@@ -110,10 +172,10 @@ export async function render({ root, query, session }) {
 
     <section class="home-section">
       <div class="wrap">
-        <h2>Search by city</h2>
-        <p class="section-lead">Pick a city to see the homes listed there.</p>
+        <h2>Search by district</h2>
+        <p class="section-lead">Pick a district to see the homes listed there.</p>
         <div class="chips" id="city-chips">
-          ${session.meta.cities.map(city => html`<button type="button" class="chip ${filters.area.toLowerCase() === city.toLowerCase() ? 'active' : ''}" data-city="${city}">${city}</button>`)}
+          ${session.meta.cities.map(city => html`<button type="button" class="chip ${filters.city === city ? 'active' : ''}" data-city="${city}" aria-pressed="${String(filters.city === city)}">${city}</button>`)}
         </div>
       </div>
     </section>
@@ -172,42 +234,137 @@ export async function render({ root, query, session }) {
       const value = String(data.get(key) ?? '').trim();
       if (value && !(key === 'purpose' && value === 'any') && !(key === 'sort' && value === 'recommended')) values[key] = value;
     }
+    // A distance only means something next to a place.
+    if (!values.near && !values.lat) delete values.radius;
+    if (values.near) {
+      delete values.lat;
+      delete values.lng;
+    }
     return values;
   }
 
   function markCity() {
-    const area = form.area.value.trim().toLowerCase();
-    for (const chip of root.querySelectorAll('[data-city]')) chip.classList.toggle('active', chip.dataset.city.toLowerCase() === area);
+    for (const chip of root.querySelectorAll('[data-city]')) {
+      const active = chip.dataset.city === form.city.value;
+      chip.classList.toggle('active', active);
+      chip.setAttribute('aria-pressed', String(active));
+    }
+  }
+
+  // The address holds the filters and the page (page 1 is left out), so a search can be shared.
+  function setAddress(values, page) {
+    const params = new URLSearchParams(values);
+    if (page > 1) params.set('page', page);
+    const text = params.toString();
+    const shown = new URLSearchParams(params);
+    if (view === 'map') shown.set('view', 'map');
+    history.replaceState(null, '', `#/${shown.toString() ? `?${shown}` : ''}`);
+    return text;
+  }
+
+  // PB-37: Google Maps next to every matching home (no pages). The map shows one pin: the chosen place or
+  // your location first, then the home you press in the list.
+  async function showMap(values, result) {
+    const params = new URLSearchParams(values).toString();
+    const { pins, near } = await api.get(`/api/properties/map?${params}`);
+    const box = $('#results-map', results);
+    if (!box) return;
+    const place = near || result.near;
+    const centre = place || pins[0];
+    const where = place?.name === 'Your location' ? 'You are here' : place?.name;
+    mount(box, html`
+      <div class="map-layout">
+        <div class="map-frame" id="map-frame">${centre ? googleMap(centre.lat, centre.lng, where || pins[0].title, place ? 14 : 16) : ''}</div>
+        <ol class="map-list" aria-label="Homes on the map">${pins.map(pin => html`<li>
+          <button type="button" class="map-row" data-pin="${pin.id}" data-lat="${pin.lat}" data-lng="${pin.lng}" data-title="${pin.title}">
+            <strong>${pin.title}</strong>
+            <span>${pin.listingType === 'rent' ? `${taka(pin.amount)} / month` : shortTaka(pin.amount)} · ${pin.areaName}</span>
+            ${pin.distanceKm !== null && pin.distanceKm !== undefined ? html`<span class="map-distance">${pin.distanceKm} km away</span>` : ''}
+          </button>
+          <a class="map-open" href="#/property/${pin.id}?from=search">Open</a></li>`)}</ol>
+      </div>
+      <p class="small muted">${where ? html`The map shows <strong>${where}</strong>. ` : ''}Press a home in the list to see exactly where it is.
+        ${place ? html`<button class="link-button" type="button" data-map-home>Show ${where === 'You are here' ? 'my location' : where} again</button>` : ''}</p>`);
+    box.addEventListener('click', event => {
+      const row = event.target.closest('[data-pin]');
+      if (row) {
+        mount($('#map-frame', box), googleMap(row.dataset.lat, row.dataset.lng, row.dataset.title, 17));
+        box.querySelectorAll('.map-row.active').forEach(other => other.classList.remove('active'));
+        row.classList.add('active');
+      }
+      if (event.target.closest('[data-map-home]') && place) {
+        mount($('#map-frame', box), googleMap(place.lat, place.lng, where, 14));
+        box.querySelectorAll('.map-row.active').forEach(other => other.classList.remove('active'));
+      }
+    });
+  }
+
+  // Asks for the visitor's location (the browser asks for permission), then searches around it.
+  async function locate() {
+    const button = $('#my-location', root);
+    button.disabled = true;
+    button.textContent = 'Finding you…';
+    try {
+      const here = await askLocation();
+      locationProblem = '';
+      form.near.value = '';
+      form.lat.value = here.lat;
+      form.lng.value = here.lng;
+      form.sort.value = 'distance';
+      toast(`Location found (within about ${here.accuracy} m).`);
+      await load(true);
+    } catch (error) {
+      locationProblem = error.message;
+      if (view === 'map') await load(false, 1);
+      else toast(error.message, true);
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Use my location';
+    }
   }
 
   // `byVisitor` is true for a search the visitor started; the page then scrolls to the results.
-  async function load(byVisitor = false) {
+  // Changing a filter starts again at page 1; the page buttons pass the page they show.
+  async function load(byVisitor = false, toPage = 1) {
     markCity();
     const values = currentFilters();
-    const params = new URLSearchParams(values).toString();
-    history.replaceState(null, '', `#/${params ? `?${params}` : ''}`);
+    const params = setAddress(values, toPage);
     mount(results, loading);
     try {
-      const { properties, total } = await api.get(`/api/properties?${params}`);
+      const result = await api.get(`/api/properties?${params}`);
+      const { properties, total, page, pages } = result;
+      // A page past the end comes back as the last page; keep the address in step.
+      if (page !== toPage) setAddress(values, page);
+      const first = (page - 1) * result.pageSize + 1;
+      const last = first + properties.length - 1;
       const purposeWord = values.purpose === 'rent' ? 'for rent' : values.purpose === 'sale' ? 'for sale' : '';
       mount(results, html`
         <div class="results-head">
           <h2>${total} ${total === 1 ? 'home' : 'homes'} ${purposeWord}</h2>
+          ${pages > 1 && view === 'list' ? html`<span class="muted">Showing ${first}–${last} · page ${page} of ${pages}</span>` : ''}
+          ${result.near ? html`<span class="badge badge-near">Within ${result.near.radiusKm} km of ${result.near.name === 'Your location' ? 'you' : result.near.name}</span>` : ''}
+          <div class="view-switch" role="group" aria-label="Show results as">
+            <button type="button" data-view="list" aria-pressed="${String(view === 'list')}" class="${view === 'list' ? 'active' : ''}">List</button>
+            <button type="button" data-view="map" aria-pressed="${String(view === 'map')}" class="${view === 'map' ? 'active' : ''}">Map</button>
+          </div>
           ${values.verified ? html`<span class="badge badge-verified">Showing verified listings only</span>` : ''}
           ${user?.role === 'buyer_tenant' ? html`<button class="btn btn-outline btn-small save-search" type="button" data-save-search>
             Save this search<span class="hint"> · get an alert for new verified homes</span></button>` : ''}
         </div>
         ${total ? html`
-          <div class="card-grid">${properties.slice(0, FIRST_PAGE).map(card => propertyCard(card))}</div>
-          ${total > FIRST_PAGE ? html`
-            <div class="card-grid more-cards" hidden>${properties.slice(FIRST_PAGE).map(card => propertyCard(card))}</div>
-            <p class="show-more"><button class="btn btn-outline" type="button" data-show-more>Show all ${total} homes</button></p>` : ''}` : html`
+          ${view === 'map' && locationProblem ? html`<div class="notice notice-warn location-notice"><strong>We could not get your location</strong>
+            <p>${locationProblem}</p>
+            <button class="btn btn-outline btn-small" type="button" data-retry-location>Try again</button></div>` : ''}
+          ${view === 'map' ? html`<div class="results-map" id="results-map">${loading}</div>` : html`
+            <div class="card-grid">${properties.map(card => propertyCard(card, 'search', result.near))}</div>
+            ${pager(page, pages)}`}` : html`
           <div class="empty">
             <h3>No homes match your search yet</h3>
             <p>Try a wider rent or price range, another area, or fewer bedrooms. New listings are added every day.</p>
             <button class="btn btn-primary" type="button" data-clear>Show all homes</button>
           </div>`}
       `);
+      if (view === 'map' && total) showMap(values, result);
       if (byVisitor) results.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (error) {
       if (error.fields && Object.keys(error.fields).length) {
@@ -235,6 +392,12 @@ export async function render({ root, query, session }) {
     form.minPrice.value = '';
     form.maxPrice.value = '';
     form.type.value = '';
+    form.city.value = '';
+    form.furnished.value = '';
+    form.near.value = '';
+    form.radius.value = '5';
+    form.lat.value = '';
+    form.lng.value = '';
     form.bedrooms.value = '';
     form.verified.checked = false;
     form.sort.value = 'recommended';
@@ -246,8 +409,8 @@ export async function render({ root, query, session }) {
   $('#city-chips', root).addEventListener('click', event => {
     const chip = event.target.closest('[data-city]');
     if (!chip) return;
-    // Clicking the active city again clears it.
-    form.area.value = chip.classList.contains('active') ? '' : chip.dataset.city;
+    // Clicking the active district again clears it.
+    form.city.value = chip.classList.contains('active') ? '' : chip.dataset.city;
     load(true);
   });
   form.addEventListener('change', event => {
@@ -257,7 +420,13 @@ export async function render({ root, query, session }) {
       form.maxPrice.value = '';
       updateRangeLabels();
     }
-    if (['purpose', 'verified', 'sort', 'type', 'bedrooms'].includes(event.target.name)) load();
+    if (event.target.name === 'near') {
+      // A chosen place replaces "my location".
+      form.lat.value = '';
+      form.lng.value = '';
+      if (!form.near.value && form.sort.value === 'distance') form.sort.value = 'recommended';
+    }
+    if (['purpose', 'verified', 'sort', 'type', 'city', 'bedrooms', 'furnished', 'near', 'radius'].includes(event.target.name)) load();
   });
   $('#clear-search', root).addEventListener('click', clearSearch);
   results.addEventListener('click', async event => {
@@ -274,11 +443,17 @@ export async function render({ root, query, session }) {
         save.disabled = false;
       }
     }
-    const more = event.target.closest('[data-show-more]');
-    if (more) {
-      $('.more-cards', results).hidden = false;
-      more.parentElement.remove();
+    const pageButton = event.target.closest('[data-page]');
+    if (pageButton && !pageButton.disabled) load(true, Number(pageButton.dataset.page));
+    const viewButton = event.target.closest('[data-view]');
+    if (viewButton && viewButton.dataset.view !== view) {
+      view = viewButton.dataset.view;
+      // Opening the map without a place asks for the visitor's location, to show where they are.
+      if (view === 'map' && !form.near.value && !form.lat.value) locate();
+      else load(false, 1);
     }
+    if (event.target.closest('[data-retry-location]')) locate();
   });
-  await load();
+  $('#my-location', root).addEventListener('click', locate);
+  await load(false, firstPage);
 }

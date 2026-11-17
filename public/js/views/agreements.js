@@ -3,6 +3,7 @@
 
 import { api } from '../api.js';
 import { $, AGREEMENT_STATUS, badge, formatDate, html, mount, submitting, taka, toast } from '../ui.js';
+import { mountRentPayments } from './sprint5.js';
 
 const STEPS = ['draft', 'under_review', 'approved', 'signed'];
 
@@ -156,6 +157,7 @@ function actionPanel(agreement) {
 
 export async function renderDetail({ root, params, navigate }) {
   const agreement = await api.get(`/api/agreements/${params.id}`);
+  const showPayments = () => mountRentPayments($('#rent-payments', root), agreement, navigate).catch(error => toast(error.message, true));
   const signedLine = (name, at) => (at ? html`<strong>&#10003; ${name}</strong><span class="sub">signed ${formatDate(at, true)}</span>` : html`${name}<span class="sub">not signed yet</span>`);
   mount(root, html`
     <a class="back-link" href="#/agreements">&larr; Rent agreements</a>
@@ -181,6 +183,7 @@ export async function renderDetail({ root, params, navigate }) {
           <div class="form-actions">${pdfLink(agreement)}</div>
         </div>
         ${actionPanel(agreement)}
+        <div id="rent-payments"></div>
       </div>
       <aside class="panel">
         <h3>Review and signatures</h3>
@@ -197,6 +200,7 @@ export async function renderDetail({ root, params, navigate }) {
     toast(message);
     navigate(`/agreements/${agreement.id}`);
   };
+  showPayments();   // PB-43: the monthly rent schedule of a signed agreement
   $('[data-submit]', root)?.addEventListener('click', async event => {
     event.target.disabled = true;
     try {

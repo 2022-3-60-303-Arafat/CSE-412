@@ -1,8 +1,8 @@
-# Property Finder Bangladesh (PFB): Sprints 1 to 4
+# Property Finder Bangladesh (PFB): Sprints 1 to 5
 
 CSE412 Software Engineering · Section 07 · Group 08
 
-This build delivers **every story in the product backlog: Sprint 1 (PB-01 to PB-09), Sprint 2 (PB-10 to PB-17), Sprint 3 (PB-18 to PB-25) and Sprint 4 (PB-26 to PB-33)** from
+This build delivers **every story in the product backlog: Sprint 1 (PB-01 to PB-09), Sprint 2 (PB-10 to PB-17), Sprint 3 (PB-18 to PB-25), Sprint 4 (PB-26 to PB-33) and Sprint 5 (PB-34 to PB-45)** from
 `PFB_Product_Backlog_4_Sprints.xlsx`. Class and table names follow `PFB_Class_Based_Modeling_CRC_Cards.docx`.
 
 ## Run it
@@ -19,7 +19,7 @@ Do not open the site through VS Code Live Server or by double-clicking `index.ht
 
 All data is **demo data** (sample listings, people and papers). Real data will be collected in a later sprint.
 
-- `python server.py --reset` deletes all data and uploads, then loads fresh demo data (use it before each demo).
+- `python server.py --reset` deletes all data, uploaded papers and listing photos, then loads fresh demo data (use it before each demo).
 - `python server.py --port 9000` runs the site on another port.
 
 ### Demo accounts
@@ -38,7 +38,7 @@ All demo accounts use the password **`Demo@1234`**. The login page also lists th
 
 ## The database
 
-Everything is stored in one SQLite database file, `instance/pfb.sqlite3`. It is created on the first start; uploaded papers are saved in `instance/uploads/`. You can open the file with any SQLite viewer (for example *DB Browser for SQLite*) to show the tables.
+Everything is stored in one SQLite database file, `instance/pfb.sqlite3`. It is created on the first start; uploaded papers are saved in `instance/uploads/` (private) and listing photos in `public/uploads/properties/` (public). You can open the file with any SQLite viewer (for example *DB Browser for SQLite*) to show the tables.
 
 | Group | Tables |
 |---|---|
@@ -47,6 +47,7 @@ Everything is stored in one SQLite database file, `instance/pfb.sqlite3`. It is 
 | Legal verification | `verification_requests`, `legal_documents`, `verification_reports` (the legal report of each verified listing), `high_demand_areas`, `audit_log` |
 | Consultations (Sprint 3) | `consultations` (free chats and paid bookings), `chat_messages`, `payments` (paid and failed attempts), `notifications` |
 | Agreements and reports (Sprint 4) | `rent_agreements`, `saved_searches`, `listing_reports` |
+| Sprint 5 | `site_visits`, `phone_verifications`, `duplicate_flags`, `reviews`, `rent_payments`; new columns `users.phone_verified_at`, `properties.latitude` / `longitude`, `property_images.file_hash`, `payments.account_masked` |
 | Browsing history | `property_views` (every listing opened: which listing, who or "guest", how it was found, when), `search_history` (searches by signed-in users: filters, number of results, when) |
 
 How browsing history works:
@@ -55,7 +56,26 @@ How browsing history works:
 - The admin panel has a **Browsing activity** tab: total views, most viewed listings, most searched areas, latest views and searches.
 - Privacy: guests are counted without any personal details, and no IP addresses are stored. Opening the same listing again within 30 minutes is not counted twice. Views by the listing's own owner, advocates and admins are not counted. Clearing history unlinks the views from the person but keeps the listing's view count.
 
-An older database is upgraded automatically on start-up (schema version 1, 2, 3 or 4 to 5); no reset is needed. Advocates already in an older database stay verified and get the standard fee of 500 taka.
+An older database is upgraded automatically on start-up (schema version 1 to 7 up to 8); no reset is needed. Owners who already had listings keep publishing without confirming their phone again. Advocates already in an older database stay verified and get the standard fee of 500 taka.
+
+## Listing photos
+
+Owners add photos of their house or flat on the listing form (**+ List a property** or **Edit**). Buyers see them on the listing page as a gallery (a main photo with clickable thumbnails) and the cover photo on search cards. A listing without photos shows a placeholder.
+
+- JPG, PNG or WebP only, up to 5 MB each and 10 photos per listing. The server checks the file name, the file type the browser sends and the file's first bytes, so a renamed file of another kind is refused with a clear message.
+- The first photo becomes the **cover**. On the edit page each photo has **Set as cover** and **Delete**. Deleting the cover makes the oldest remaining photo the cover. Deleting a photo also removes its file.
+- Only the listing's owner (or an admin, through the API) can add, delete or change photos. Every change is in the audit log.
+- Files are saved as `public/uploads/properties/<listing id>/<random name>.<jpg|png|webp>`; the owner's file name is never used. The photos are public on purpose. Uploaded photos are not in git (only the folder's `.gitkeep` is).
+- In the database, photos are rows in `property_images` (`is_cover`, `file_path`). The demo listings keep their linked photos (with no `file_path`), so an owner's new photo does not replace a demo cover until they choose **Set as cover**.
+
+## My profile
+
+Every signed-in user opens **My profile** from the picture and name at the top right. They can:
+- upload a profile picture (JPG, PNG or WebP, up to 2 MB) or remove it; it shows in the menu and next to an owner's name on listings;
+- change their name, mobile number, occupation and a short "About me";
+- change their password (other devices are signed out).
+
+An owner who changes their mobile number confirms the new number with a code before the next listing (PB-35). Pictures are saved in `public/uploads/avatars/` with random names.
 
 ## Advocate sign-up and in-person verification
 
@@ -112,7 +132,7 @@ Good to know:
 python -m unittest discover -s tests -v
 ```
 
-There are 53 automated tests: at least one per story's acceptance criteria (9 for Sprint 3, 7 for Sprint 4), 5 for browsing history, 4 for advocate sign-up and verification, and 2 for the hosted version. Set `PFB_TEST_WSGI=1` to run all of them against the hosted (WSGI) version. Each test starts its own server on a temporary database, so your demo data is never touched.
+There are 90 automated tests: at least one per story's acceptance criteria (9 for Sprint 3, 7 for Sprint 4, 17 for Sprint 5), 5 for browsing history, 4 for advocate sign-up and verification, 6 for search filters and pages, 9 for listing photos, 5 for the profile page, and 2 for the hosted version. Set `PFB_TEST_WSGI=1` to run all of them against the hosted (WSGI) version. Each test starts its own server on a temporary database, so your demo data is never touched.
 
 ## Where each story is done
 
@@ -124,7 +144,7 @@ There are 53 automated tests: at least one per story's acceptance criteria (9 fo
 | PB-04 | Admin adds advocates (with Bar Council ID), blocks, unblocks and removes them, and verifies advocates who applied themselves after an in-person appointment. Blocking signs the advocate out and returns their open reviews to the queue. | Admin panel → Advocates |
 | PB-05 | Sell / Rent out choice on the listing form. Rent listings save monthly rent, deposit, available-from date, minimum lease, utilities and tenant preference. Wrong values show a message next to the field. | `pfb/validation.py`, `public/js/views/owner.js` |
 | PB-06 | The listing page shows rent, deposit and **move-in cost = first rent + deposit**. | `public/js/views/property.js` |
-| PB-07 | Search by All / Buy / Rent, area or city, type, min-max price (the labels switch to rent per month), bedrooms and sort. A friendly message shows when nothing matches. | `search_properties`, `public/js/views/home.js` |
+| PB-07 | Search by All / Buy / Rent, area or city, district, type, min-max price (the labels switch to rent per month), bedrooms, furnished / unfurnished and sort, with 12 homes per page. Every filter and the page number are in the address (for example `#/?purpose=rent&city=Dhaka&furnished=yes&page=2`), so a search can be shared and the form shows the same choices when it is opened. A friendly message shows when nothing matches. | `search_properties`, `public/js/views/home.js` |
 | PB-08 | Rent affordability calculator (up to 30% of income = affordable, 30–40% = a stretch, more = not affordable). The EMI calculator still works. | `public/js/views/calculator.js` |
 | PB-09 | New listings are live at once with an **Unverified** label; the status is stored in `properties.verification_status`. | `create_property` |
 | PB-10 | "Request Legal Verification" checkbox on the new listing form (and a button in My listings) creates a **Pending** request. The owner sees its status. | `create_verification_request` |
@@ -148,8 +168,20 @@ There are 53 automated tests: at least one per story's acceptance criteria (9 fo
 | PB-29 | The admin panel opens on a **Platform report**: verified and unverified listings, for sale and for rent, the verification pipeline, each advocate's pending work, consultations and rent agreements. | `admin_report` |
 | PB-30 | Signed-in users can **Report this listing** from the listing page. The admin's **Listing reports** tab dismisses a report or removes the listing, which then leaves the search results; the owner and the reporters are told. | `report_listing`, `resolve_listing_report` |
 | PB-31 | Every page works on a phone (checked at 390 px wide, no sideways scrolling). Photos load only when they scroll into view, and the search cards ask for smaller photos than the listing page. | `photo()` in `public/js/ui.js` |
-| PB-32 | 53 automated tests cover every story, and the whole flow of each sprint was also run in a browser. See "Known limitations" below for what is not covered. | `tests/test_api.py` |
-| PB-33 | This README holds the demo steps for all four sprints and the steps to put the site online. | `README.md` |
+| PB-32 | Automated tests cover every story, and the whole flow of each sprint was also run in a browser. See "Known limitations" below for what is not covered. | `tests/test_api.py` |
+| PB-33 | This README holds the demo steps for all five sprints and the steps to put the site online. | `README.md` |
+| PB-34 | **Visit this home** on a listing page: a tenant picks a one-hour slot in the next 14 days and adds a note. A slot cannot be taken twice. The owner confirms or declines (with a reason) under **Visits**; both get a notification, and the address and phone numbers are shared only after the owner confirms. The tenant can cancel before the visit. | `pfb/sprint5.py`, `visitPanel`, `renderVisits` |
+| PB-35 | A new owner confirms their mobile number with a 6-digit code before the first listing can be published. The code expires after 10 minutes, 5 wrong tries block it and only a hash is stored. Listings show **Phone verified**. There is no SMS gateway, so the code is shown on screen (set `PFB_DEMO_SMS=0` once SMS is connected). | `send_phone_code`, `verify_phone_code`, `phonePanel` |
+| PB-36 | Paying a consultation with **bKash** or **Nagad** asks for the wallet number and the wallet PIN (sandbox: the PIN is checked for shape and never stored). The receipt shows the wallet as `017*****678` and the transaction ID. | `pay_consultation` in `pfb/consult.py` |
+| PB-37 | Search **Near a place** (21 landmarks: universities, business districts, hospitals, the airport) or **Use my location**, within 1, 3, 5 or 10 km, nearest first, with the distance on each card. **Map** opens Google Maps next to the list of matching homes, nearest first; pressing a home shows its exact pin. Opening the map asks for the visitor's location (the browser asks permission) and explains how to turn it on if it is blocked or off. Each listing page shows its Google map with **Get directions**. Owners set the position with **Use my current location** or by pasting it from Google Maps; otherwise the area centre is used. Saved searches can be near a landmark too. | `search_conditions`, `pfb/places.py`, `askLocation`, `googleMap` |
+| PB-38 | **+ Compare** on a listing page adds it to a list of up to 3 (kept in the browser). **Compare homes** shows price or rent, deposit, move-in cost, size, price per sqft, bedrooms and the legal check side by side and marks the best value in each row. | `compare`, `renderCompare` |
+| PB-39 | A photo identical to one on another owner's listing, or a description at least 85% the same, creates a flag for the admin (**Duplicate listings** tab), who dismisses it or removes the copy. Reusing your own photos is fine; short descriptions are not compared. | `check_duplicate_photo`, `check_duplicate_text` |
+| PB-40 | **Price guide** page: average, lowest and highest rent or price by district and by area and bedroom count, for groups of 3 or more active listings. The listing page says how far the price is above or below similar homes (the area, or the district when the area has fewer than 3). The admin report includes it. | `price_guide`, `price_position` |
+| PB-41 | After a completed consultation the buyer rates the advocate (1 to 5 stars, optional comment), once. The average and the number of reviews show when choosing an advocate. | `review_advocate`, `reviewPanel` |
+| PB-42 | **বাংলা / English** button in the header. The menu, search, listing cards, listing page, log-in and sign-up pages switch to Bangla; the choice is remembered in the browser. Text people typed is shown as written. | `public/js/i18n.js` |
+| PB-43 | When both sides sign a rent agreement, one rent payment per month of the lease is created. The tenant gets a reminder 3 days before each due date and when it is overdue (the landlord too). The tenant marks a month as paid and the landlord confirms it, on the agreement page. | `create_rent_schedule`, `send_rent_reminders`, `mountRentPayments` |
+| PB-44 | **My profile** (from the picture and name in the header): upload, change or remove a profile picture, edit name, phone, occupation and "about me", and change the password (other devices are signed out). An owner who changes their phone confirms it again. | `pfb/profile.py`, `public/js/views/profile.js` |
+| PB-45 | Owners upload photos (JPG, PNG, WebP, up to 5 MB, 10 per listing), choose the cover, and delete photos. The listing page shows a gallery; search cards show the cover. | `pfb/photos.py`, `public/js/views/owner.js` |
 | PB-25 | A bell in the menu shows the unread count. Owners are told the verification result; advocates are told about new requests, questions and bookings; buyers are told about replies, accepted or refused bookings and notes. Clicking a notification opens the right page. | `notify` in `pfb/db.py`, `/notifications` |
 
 The baseline features the backlog assumes (sign up, login, search, listing page, inquiries with owner replies, favorites, EMI calculator, admin panel) were rebuilt as part of this rewrite.
@@ -189,10 +221,25 @@ Run `python server.py --reset` first.
 5. As any buyer → open "Residential plot in Purbachal" → **Report this listing**. As `admin@pfb.test` → **Listing reports** → write a note → **Remove the listing**. It no longer appears in search.
 6. As `admin@pfb.test` → **Platform report** shows the counts of verified, unverified, sale and rent listings and each advocate's pending work.
 
+**Sprint 5:** site visit, phone code, bKash, map search, compare, price guide, rating, Bangla, duplicates, rent reminders.
+1. As `tenant@pfb.test` → open "Sunny apartment in Banasree" → **Visit this home** → pick a day and time → **Ask for this visit**. As `owner@pfb.test` → **Visits** → **Confirm visit**. Back as the tenant, the visit shows the owner's phone and the address.
+2. **Sign up** a new owner account → **+ List a property** asks to confirm the mobile number → **Send code** (the demo shows the code) → enter it → the listing form opens. The published listing shows **Phone verified**.
+3. As `tenant@pfb.test` → **Consultations** → the request waiting for payment → choose **bKash**, number `01712345678`, PIN `12345` → **Pay**. The receipt shows `017*****678`.
+4. **Find homes** → press **Map**. The browser asks to use your location: allow it (and turn on Location on the device) and the map shows where you are, with the nearest homes listed. Or choose **Near a place** = University of Dhaka, within 3 km. Press a home in the list to see its exact pin; open a listing for **Get directions**.
+5. Open two or three rent listings → **+ Compare** on each → **Compare homes**. The listing page also shows how its rent compares with similar homes; **Price guide** in the menu shows the averages.
+6. As `tenant2@pfb.test` → **Consultations** → the completed one → give 4 stars. The rating shows when booking that advocate.
+7. Press **বাংলা** in the header: the menu, search and listing pages switch to Bangla. Press **English** to switch back.
+8. As `owner2@pfb.test`, publish a listing that copies the description of "Sunny apartment in Banasree". As `admin@pfb.test` → **Duplicate listings** shows the flag → **Remove listing**.
+9. As `tenant@pfb.test` → **Agreements** → sign the approved agreement with `Rafi Chowdhury`: a **Monthly rent** table appears. **Mark as paid** a month; as `owner@pfb.test`, **Confirm received**.
+
 ## Known limitations
 
-- Payments are simulated; no real bKash, Nagad or card payment is made.
-- No email or SMS is sent. Appointments, alerts and replies are shown inside the site (the bell and the Notifications page).
+- Payments are simulated (sandbox); no real bKash, Nagad or card payment is made, and wallet PINs are never stored.
+- No email or SMS is sent. Appointments, alerts and replies are shown inside the site (the bell and the Notifications page). The phone confirmation code is shown on screen for the same reason.
+- The map (PB-37) is Google's embedded map, which needs internet but no API key. It shows one pin at a time (the chosen place or the home pressed in the list). Showing every home as a pin at once needs the paid Google Maps JavaScript API and a key. Landmark and area positions are approximate (about 300 m); search by distance works without the map.
+- The browser asks for location only on a secure address: `http://127.0.0.1` (this computer) or `https://` (PythonAnywhere).
+- Rent reminders are created when the tenant or landlord opens the site, not by a background job, so someone who never logs in sees them on their next visit.
+- The Bangla switch translates the main pages (menu, search, listing cards, listing page, log in, sign up). Owner, advocate and admin pages stay in English.
 - Chat messages appear within about 8 seconds, not instantly.
 - Signing an agreement on the site is a typed-name signature. For a court-enforceable agreement it still has to be printed on stamp paper and registered.
 - The legal report and the agreement PDF use a standard font, so Bangla text in a listing would not print correctly in them.
@@ -207,6 +254,10 @@ pfb/db.py            schema (all tables, audit-log triggers)
 pfb/api.py           API endpoints for Sprints 1 and 2, with role checks
 pfb/consult.py       API endpoints for Sprint 3: chat, bookings, payments, notifications
 pfb/sprint4.py       API endpoints for Sprint 4: rent agreements, saved searches, admin report, listing reports
+pfb/photos.py        listing photos: upload, delete, set cover
+pfb/sprint5.py       API endpoints for Sprint 5: visits, phone code, compare, duplicates, price guide, reviews, rent payments
+pfb/places.py        area centres and landmarks for map search (PB-37)
+pfb/profile.py       my profile: details, profile picture, password
 pfb/reports.py       legal reports and badge levels (PB-18, PB-19)
 pfb/pdf.py           a small PDF writer for the legal report and the rent agreement
 pfb/validation.py    form rules and error messages
@@ -215,7 +266,11 @@ pfb/web.py           small router on top of http.server, security headers
 pfb/wsgi_app.py      the same site as a WSGI app, for hosting
 pfb/seed.py          demo users, listings, verification requests, sample PDFs, consultations and notifications
 public/              the website (HTML, CSS, JavaScript modules, no build step)
-tests/test_api.py    acceptance tests for PB-01 to PB-31
+public/js/i18n.js    Bangla / English switch (PB-42)
+public/js/views/sprint5.js  Sprint 5 pages and panels (Google Maps helpers too)
+public/js/views/profile.js  the My profile page
+tests/test_api.py    acceptance tests for PB-01 to PB-43
+public/uploads/      listing photos and profile pictures (public; not in git)
 instance/            database and uploaded papers (created at run time, not in git)
 ```
 

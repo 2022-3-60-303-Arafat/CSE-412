@@ -6,9 +6,14 @@ import {
   $, $$, DOCUMENT_LABELS, LISTING_STATUS, REQUEST_STATUS, REVIEW_STATUS, badge, confirmClick, describeValue, formatDate,
   html, mount, numberOrBlank, priceLine, submitting, toast, verificationBadge, ACTION_LABELS,
 } from '../ui.js';
+import { askLocation, googleMap, parseCoordinates, phonePanel, setUpPhone } from './sprint5.js';
 
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 const ALLOWED_EXTENSIONS = ['pdf', 'jpg', 'jpeg', 'png'];
+const PHOTO_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp'];
+const MAX_PHOTOS = 10;
+// Upload errors to show on the edit page that opens after a save.
+let pendingPhotoErrors = [];
 
 // ------------------------------------------------------------------ my listings
 
@@ -104,11 +109,65 @@ function today() {
   return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
 }
 
+// The current photos on the edit page, each with "Set as cover" and "Delete".
+function photoGrid(images) {
+  if (!images.length) return html`<p class="muted small">No photos yet. Buyers see a placeholder until you add one.</p>`;
+  return html`<ul class="photo-grid">${images.map((image, index) => html`<li class="photo-tile${image.isCover ? ' is-cover' : ''}">
+    <img src="${image.url}" alt="Photo ${index + 1}" loading="lazy" decoding="async">
+    ${image.isCover ? html`<span class="badge badge-document_verified photo-cover-badge">Cover</span>` : ''}
+    <div class="photo-actions">
+      ${image.isCover ? '' : html`<button class="btn btn-outline btn-small" type="button" data-photo-cover="${image.id}">Set as cover</button>`}
+      <button class="btn btn-danger btn-small" type="button" data-photo-delete="${image.id}">Delete</button>
+    </div>
+  </li>`)}</ul>`;
+}
+
+// Split the chosen files into ones that can be uploaded and clear messages for the rest.
+function checkPhotos(files, existingCount) {
+  const good = [];
+  const errors = [];
+  for (const file of files) {
+    const extension = file.name.includes('.') ? file.name.split('.').pop().toLowerCase() : '';
+    if (!PHOTO_EXTENSIONS.includes(extension)) {
+      errors.push(`${file.name}: only JPG, PNG and WebP photos are accepted.`);
+    } else if (file.size > MAX_UPLOAD_BYTES) {
+      errors.push(`${file.name}: larger than 5 MB. Please choose a smaller photo.`);
+    } else if (existingCount + good.length >= MAX_PHOTOS) {
+      errors.push(`${file.name}: a listing can have at most ${MAX_PHOTOS} photos.`);
+    } else {
+      good.push(file);
+    }
+  }
+  return { good, errors };
+}
+
+// Upload photos one by one. Returns the messages for the ones the server refused.
+async function uploadPhotos(propertyId, files) {
+  const failed = [];
+  for (const file of files) {
+    try {
+      await api.uploadPhoto(propertyId, file);
+    } catch (error) {
+      failed.push(`${file.name}: ${error.message}`);
+    }
+  }
+  return failed;
+}
+
 export async function renderForm({ root, params, session, navigate }) {
   const editing = Boolean(params.id);
   const property = editing ? await api.get(`/api/properties/${params.id}`) : null;
   if (editing && !property.isOwner) {
     mount(root, html`<div class="empty"><h3>You can only edit your own listings</h3><a class="btn btn-primary" href="#/owner/listings">My listings</a></div>`);
+    return;
+  }
+  // PB-35: an owner confirms their mobile number before the first listing goes live.
+  if (!editing && !session.user.phoneVerified) {
+    mount(root, html`
+      <a class="back-link" href="#/owner/listings">&larr; My listings</a>
+      <div class="page-head"><div><h1>List a property</h1><p>One quick step first: confirm your mobile number.</p></div></div>
+      ${phonePanel(session.user)}`);
+    setUpPhone(root, session, () => navigate('/owner/listings/new'));
     return;
   }
   const p = property || { listingType: 'rent', propertyType: 'Apartment', city: 'Dhaka', furnished: false, bedrooms: 2, bathrooms: 2 };
@@ -154,6 +213,20 @@ export async function renderForm({ root, params, session, navigate }) {
           <label class="field"><span>City</span><select name="city">
             ${meta.cities.map(city => html`<option ${selected(p.city === city)}>${city}</option>`)}</select></label>
           <label class="field full"><span>Full address</span><input name="address" value="${p.address || ''}" placeholder="House, road, area, city"></label>
+          <div class="full map-pin" data-error-for="latitude">
+            <input type="hidden" name="latitude" value="${p.latitude ?? ''}"><input type="hidden" name="longitude" value="${p.longitude ?? ''}">
+            <strong>Exact location on the map <span class="hint">optional</span></strong>
+            <p class="small muted">Tenants who search near their office or university find homes by this position.
+              Without it, the centre of the area is used.</p>
+            <div class="inline-form">
+              <button class="btn btn-outline btn-small" type="button" id="pin-here">Use my current location</button>
+              <label class="field"><span>Or paste from Google Maps (latitude, longitude)</span>
+                <input id="pin-coords" value="${p.latitude ? `${p.latitude}, ${p.longitude}` : ''}" placeholder="23.7808, 90.4167" inputmode="decimal" autocomplete="off"></label>
+            </div>
+            <p class="small muted">Standing at the property? Press "Use my current location". Otherwise, in Google Maps right-click the building and
+              click the two numbers at the top to copy them.</p>
+            <div id="pin-preview">${p.latitude ? googleMap(p.latitude, p.longitude, 'Listing position', 16) : ''}</div>
+          </div>
         </div>
       </fieldset>
 
@@ -183,6 +256,16 @@ export async function renderForm({ root, params, session, navigate }) {
         <legend>Description</legend>
         <label class="field"><span>Describe the home <span class="hint">optional</span></span>
           <textarea name="description" maxlength="2000">${p.description || ''}</textarea></label>
+      </fieldset>
+
+      <fieldset class="form-section">
+        <legend>Photos</legend>
+        <p class="muted small">JPG, PNG or WebP, up to 5 MB each and ${MAX_PHOTOS} photos per listing. The cover photo is shown in search results; the first photo you add becomes the cover.</p>
+        ${editing ? html`<div id="photo-grid">${photoGrid(p.images || [])}</div>` : ''}
+        <label class="field"><span>Add photos <span class="hint">you can choose several at once</span></span>
+          <input type="file" name="photos" multiple accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"></label>
+        <p class="muted small" id="photo-chosen" aria-live="polite"></p>
+        <ul class="photo-errors" id="photo-errors" aria-live="polite"></ul>
       </fieldset>
 
       ${editing ? html`
@@ -221,9 +304,93 @@ export async function renderForm({ root, params, session, navigate }) {
       ? `Tenants will see a move-in cost of ৳ ${(monthly + deposit).toLocaleString('en-IN')} (first month's rent + deposit).`
       : '';
   }
+  // PB-37: the map position. Only a position the owner set is sent; otherwise the server keeps or works out one.
+  let pinMoved = false;
+  function setPin(lat, lng) {
+    field('latitude').value = lat;
+    field('longitude').value = lng;
+    pinMoved = true;
+    $('#pin-coords', form).value = `${lat}, ${lng}`;
+    mount($('#pin-preview', form), googleMap(lat, lng, 'Listing position', 17));
+  }
+  $('#pin-here', form).addEventListener('click', async event => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = 'Finding you…';
+    try {
+      const here = await askLocation();
+      setPin(here.lat, here.lng);
+      toast(`Position set (within about ${here.accuracy} m). Check it on the map below.`);
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Use my current location';
+    }
+  });
+  $('#pin-coords', form).addEventListener('change', event => {
+    const text = event.target.value.trim();
+    if (!text) return;
+    const point = parseCoordinates(text);
+    if (!point) {
+      toast('Paste the position as two numbers inside Bangladesh, for example 23.7808, 90.4167.', true);
+      return;
+    }
+    setPin(point.lat, point.lng);
+  });
   form.addEventListener('change', event => { if (event.target.name === 'listingType') syncType(); });
   form.addEventListener('input', event => { if (event.target.name?.startsWith('rent.')) updateMoveIn(); });
   syncType();
+
+  // Photos: check the chosen files at once; they upload when the form is saved.
+  let images = p.images || [];
+  let chosenPhotos = [];
+  function showPhotoErrors(messages) {
+    mount($('#photo-errors', form), html`${messages.map(message => html`<li>${message}</li>`)}`);
+  }
+  showPhotoErrors(pendingPhotoErrors);
+  pendingPhotoErrors = [];
+  field('photos').addEventListener('change', () => {
+    const { good, errors } = checkPhotos(field('photos').files, images.length);
+    chosenPhotos = good;
+    $('#photo-chosen', form).textContent = good.length
+      ? `${good.length} photo${good.length === 1 ? '' : 's'} will be uploaded when you ${editing ? 'save' : 'publish'}.`
+      : '';
+    showPhotoErrors(errors);
+  });
+  form.addEventListener('click', async event => {
+    const cover = event.target.closest('[data-photo-cover]');
+    const remove = event.target.closest('[data-photo-delete]');
+    if (!cover && !remove) return;
+    if (remove && !confirmClick(remove, 'Click again to delete')) return;
+    const button = cover || remove;
+    button.disabled = true;
+    try {
+      const result = cover
+        ? await api.post(`/api/properties/${p.id}/images/${cover.dataset.photoCover}/cover`)
+        : await api.del(`/api/properties/${p.id}/images/${remove.dataset.photoDelete}`);
+      images = result.images;
+      mount($('#photo-grid', form), photoGrid(images));
+      toast(cover ? 'Cover photo changed.' : 'Photo deleted.');
+    } catch (error) {
+      toast(error.message, true);
+      button.disabled = false;
+    }
+  });
+
+  // After the listing is saved: upload the chosen photos, then go on, or stay to show what failed.
+  async function finishPhotos(propertyId, next, message) {
+    const failed = chosenPhotos.length ? await uploadPhotos(propertyId, chosenPhotos) : [];
+    if (failed.length) {
+      // The edit page shows these messages next to the photos when it opens.
+      pendingPhotoErrors = failed;
+      toast(`Listing saved, but ${failed.length} photo${failed.length === 1 ? ' was' : 's were'} not uploaded.`, true);
+      navigate(`/owner/listings/${propertyId}/edit`);
+      return;
+    }
+    toast(chosenPhotos.length ? `${message} ${chosenPhotos.length} photo${chosenPhotos.length === 1 ? '' : 's'} uploaded.` : message);
+    navigate(next);
+  }
 
   form.addEventListener('submit', event => {
     event.preventDefault();
@@ -252,23 +419,25 @@ export async function renderForm({ root, params, session, navigate }) {
         utilitiesIncluded: field('rent.utilitiesIncluded').checked,
       };
     }
+    if (pinMoved) {
+      data.latitude = Number(field('latitude').value);
+      data.longitude = Number(field('longitude').value);
+    }
     if (editing) data.listingStatus = field('listingStatus').value;
     else data.requestVerification = field('requestVerification').checked;
 
     submitting(form, async () => {
       if (editing) {
         await api.put(`/api/properties/${p.id}`, data);
-        toast('Changes saved.');
-        navigate('/owner/listings');
+        await finishPhotos(p.id, '/owner/listings', 'Changes saved.');
       } else {
         const result = await api.post('/api/properties', data);
         session.meta.areas = [...new Set([...session.meta.areas, result.property.areaName])].sort();
         if (result.verificationRequestId) {
-          toast('Your listing is live as Unverified. Now upload your papers.');
-          navigate(`/owner/verification/${result.verificationRequestId}`);
+          await finishPhotos(result.property.id, `/owner/verification/${result.verificationRequestId}`,
+            'Your listing is live as Unverified. Now upload your papers.');
         } else {
-          toast('Your listing is live as Unverified.');
-          navigate('/owner/listings');
+          await finishPhotos(result.property.id, '/owner/listings', 'Your listing is live as Unverified.');
         }
       }
     });

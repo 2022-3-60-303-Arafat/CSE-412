@@ -13,10 +13,11 @@ from datetime import date, datetime, timedelta
 from .api import (
     BANGLADESH_TIME, PROPERTY_SELECT, SEARCH_FILTER_KEYS, fetch_property, is_staff, property_json, router,
 )
-from .db import PROPERTY_TYPES, audit, notify, notify_advocates, utc_now
+from .db import PROPERTY_TYPES, audit, distance_km, notify, notify_advocates, utc_now
+from .places import LANDMARKS_BY_ID
 from .pdf import build_pdf
 from .reports import bangladesh_date
-from .validation import Checker, check_email
+from .validation import CITIES, Checker, check_email
 from .web import ApiError, Response
 
 MAX_SAVED_SEARCHES = 20
@@ -293,6 +294,8 @@ def sign_agreement(request):
     link = f"/agreements/{row['id']}"
     if other_signed:
         connection.execute("UPDATE rent_agreements SET status = 'signed' WHERE id = ?", (row["id"],))
+        from .sprint5 import create_rent_schedule   # PB-43: one rent payment per month once both have signed
+        create_rent_schedule(connection, row)
         audit(connection, user["id"], "agreement_status_changed", "rent_agreement", row["id"], "approved", "signed", row["title"])
         notify(connection, other_id, "agreement", "The rent agreement is signed by both sides",
                f"{row['title']}: download the signed agreement.", link)
@@ -371,6 +374,14 @@ def clean_filters(raw):
         filters.pop("purpose")
     checker = Checker(filters)
     checker.choice("type", "Property type", PROPERTY_TYPES, required=False)
+    checker.choice("city", "District", CITIES, required=False)
+    checker.choice("furnished", "Furnished", ("yes", "no"), required=False)
+    # PB-37: a saved search can be near a landmark (never near a person's own location, which is not stored).
+    if filters.get("near") and filters["near"] not in LANDMARKS_BY_ID:
+        checker.fail("near", "Choose a place from the list.")
+    checker.choice("radius", "Distance", ("1", "3", "5", "10"), required=False)
+    if not filters.get("near"):
+        filters.pop("radius", None)
     for key, label in (("minPrice", "Minimum price"), ("maxPrice", "Maximum price"), ("bedrooms", "Bedrooms")):
         checker.integer(key, label, 0, 10**12, required=False)
     checker.done("This search cannot be saved.")
@@ -383,6 +394,10 @@ def matches(filters, row):
         return False
     if filters.get("type") and row["property_type"] != filters["type"]:
         return False
+    if filters.get("city") and row["city"] != filters["city"]:
+        return False
+    if filters.get("furnished") and bool(row["furnished"]) != (filters["furnished"] == "yes"):
+        return False
     area = filters.get("area", "").casefold()
     if area and area not in f"{row['area_name']} {row['city']} {row['address']}".casefold():
         return False
@@ -393,6 +408,11 @@ def matches(filters, row):
         return False
     if filters.get("bedrooms") and row["bedrooms"] < int(filters["bedrooms"]):
         return False
+    landmark = LANDMARKS_BY_ID.get(filters.get("near", ""))
+    if landmark:
+        distance = distance_km(row["latitude"], row["longitude"], landmark["lat"], landmark["lng"])
+        if distance is None or distance > int(filters.get("radius") or 5):
+            return False
     return True
 
 
@@ -567,6 +587,7 @@ def resolve_listing_report(request):
 
 @router.route("GET", "/api/admin/report")
 def admin_report(request):
+    from .sprint5 import price_guide   # sprint5 is loaded after this module
     request.require("admin")
     c = request.connection
     one = lambda sql, *args: c.execute(sql, args).fetchone()[0]  # noqa: E731
@@ -638,4 +659,10 @@ def admin_report(request):
         },
         "listingReports": {status: one("SELECT COUNT(*) FROM listing_reports WHERE status = ?", status)
                            for status in ("open", "dismissed", "removed")},
+        # Sprint 5: automatic duplicate flags (PB-39) and the district price guide (PB-40).
+        "duplicateFlags": {status: one("SELECT COUNT(*) FROM duplicate_flags WHERE status = ?", status)
+                           for status in ("open", "dismissed", "removed")},
+        "priceGuide": {kind: price_guide(c, kind)["districts"] for kind in ("rent", "sale")},
+        "siteVisits": {status: one("SELECT COUNT(*) FROM site_visits WHERE status = ?", status)
+                       for status in ("requested", "confirmed", "declined", "cancelled")},
     }

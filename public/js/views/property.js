@@ -3,10 +3,44 @@
 
 import { api } from '../api.js';
 import {
-  $, BADGE_LEVELS, BADGE_MEANING, LISTING_STATUS, REPORT_REASONS, REQUEST_STATUS, TENANT_PREFERENCE, formatDate, html, mount, photo, shortTaka,
+  $, avatar, BADGE_LEVELS, BADGE_MEANING, LISTING_STATUS, REPORT_REASONS, REQUEST_STATUS, TENANT_PREFERENCE, formatDate, html, mount, photo, shortTaka, sizedUrl,
   submitting, taka, toast, verificationBadge,
 } from '../ui.js';
 import { mountChat, pollChat } from './consult.js';
+import { compareButton, locationPanel, phoneBadge, priceGuideNote, setUpCompareButtons, setUpVisit, visitPanel } from './sprint5.js';
+
+// Photo gallery: the main photo and clickable thumbnails. One photo or none shows as before,
+// with the placeholder when the listing has no photo.
+function gallery(property) {
+  const images = property.images || [];
+  if (images.length <= 1) return html`<div class="detail-photo">${photo(property, property.title)}</div>`;
+  return html`<div class="gallery">
+    <div class="detail-photo"><img id="gallery-main" src="${sizedUrl(images[0].url, 1100)}" alt="${property.title}, photo 1 of ${images.length}" decoding="async"></div>
+    <div class="gallery-thumbs">${images.map((image, index) => html`
+      <button class="gallery-thumb${index === 0 ? ' is-active' : ''}" type="button" data-photo="${index}"
+        aria-label="Show photo ${index + 1} of ${images.length}" aria-pressed="${String(index === 0)}">
+        <img src="${sizedUrl(image.url, 240)}" alt="" loading="lazy" decoding="async"></button>`)}
+    </div>
+  </div>`;
+}
+
+function setUpGallery(root, property) {
+  const main = $('#gallery-main', root);
+  if (!main) return;
+  const images = property.images;
+  root.querySelector('.gallery-thumbs').addEventListener('click', event => {
+    const thumb = event.target.closest('[data-photo]');
+    if (!thumb) return;
+    const index = Number(thumb.dataset.photo);
+    main.src = sizedUrl(images[index].url, 1100);
+    main.alt = `${property.title}, photo ${index + 1} of ${images.length}`;
+    root.querySelectorAll('.gallery-thumb').forEach(button => {
+      const active = button === thumb;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  });
+}
 
 function pricePanel(property) {
   if (!property.rent) {
@@ -143,13 +177,13 @@ export async function render({ root, params, query, session, isCurrent }) {
     <a class="back-link" href="#/">&larr; Back to search</a>
     <div class="grid-2">
       <div>
-        <div class="detail-photo">${photo(property, property.title)}</div>
+        ${gallery(property)}
         <div class="detail-badges">
           <span class="badge badge-${property.listingType}">${property.listingType === 'rent' ? 'For rent' : 'For sale'}</span>
           ${verificationBadge(property.verificationStatus, property.badgeLevel)}
           ${property.listingStatus !== 'active' ? html`<span class="badge badge-sold_rented">${LISTING_STATUS[property.listingStatus]}</span>` : ''}
         </div>
-        <h1>${property.title}</h1>
+        <div class="title-row"><h1>${property.title}</h1>${property.listingStatus === 'active' ? compareButton(property) : ''}</div>
         <p class="muted">${property.address}</p>
         <ul class="fact-list">
           <li><small>Type</small><strong>${property.propertyType}</strong></li>
@@ -162,11 +196,14 @@ export async function render({ root, params, query, session, isCurrent }) {
         ${property.description ? html`
           <h2>About this home</h2>
           <p>${property.description}</p>` : ''}
-        <p class="muted small">Listed by ${property.owner.name}</p>
+        ${locationPanel(property)}
+        <p class="muted small listed-by">${avatar(property.owner, 'small')} Listed by ${property.owner.name} ${phoneBadge(property.owner)}</p>
       </div>
       <aside class="stack">
         ${pricePanel(property)}
+        ${priceGuideNote(property)}
         ${verificationPanel(property)}
+        ${visitPanel(property, user)}
         ${askPanel(property, user)}
         ${property.isOwner ? ownerPanel(property) : contactPanel(property, user)}
         ${reportPanel(property, user)}
@@ -175,6 +212,9 @@ export async function render({ root, params, query, session, isCurrent }) {
   `);
 
   setUpAsk(root, property, user, isCurrent);
+  setUpGallery(root, property);
+  setUpVisit(root, property, isCurrent);
+  setUpCompareButtons(root);
 
   const favorite = $('#favorite', root);
   favorite?.addEventListener('click', async () => {

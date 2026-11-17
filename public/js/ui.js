@@ -85,6 +85,9 @@ export const ACTION_LABELS = {
   listing_reported: 'Listing reported',
   listing_report_dismissed: 'Listing report dismissed',
   document_uploaded: 'Paper uploaded',
+  photo_added: 'Photo added',
+  photo_deleted: 'Photo deleted',
+  photo_cover_changed: 'Cover photo changed',
   high_demand_area_added: 'High-demand area added',
   high_demand_area_removed: 'High-demand area removed',
 };
@@ -135,11 +138,25 @@ export function formatDate(value, withTime = false) {
 
 // PB-31: cards ask the photo service for a smaller picture (w=640) than the listing page (w=1100),
 // and every photo loads only when it scrolls into view.
+// Uploaded photos have no size in their address and are sent as they are.
+export function sizedUrl(url, width) {
+  return url.replace(/([?&])w=\d+/, `$1w=${width}`);
+}
+
 export function photo(property, alt, width = 1100) {
-  const src = property.image ? property.image.replace(/([?&])w=\d+/, `$1w=${width}`) : '';
   return property.image
-    ? html`<img src="${src}" alt="${alt}" loading="lazy" decoding="async">`
+    ? html`<img src="${sizedUrl(property.image, width)}" alt="${alt}" loading="lazy" decoding="async">`
     : html`<div class="photo-placeholder" role="img" aria-label="${alt}">${property.propertyType}</div>`;
+}
+
+// A profile picture, or the person's initials in a circle when there is none.
+export function avatar(person, size = 'medium') {
+  const name = person.fullName || person.name || '?';
+  const initials = name.split(/\s+/).filter(word => word && !/^adv\.?$/i.test(word)).slice(0, 2)
+    .map(word => word[0]).join('').toUpperCase() || '?';
+  return person.avatarUrl
+    ? html`<img class="avatar avatar-${size}" src="${person.avatarUrl}" alt="">`
+    : html`<span class="avatar avatar-${size}" aria-hidden="true">${initials}</span>`;
 }
 
 // ------------------------------------------------------------------ feedback
