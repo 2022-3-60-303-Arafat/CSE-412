@@ -1,5 +1,8 @@
 """JSON API for Sprint 1 (roles, rent support, search) and Sprint 2 (legal verification).
 
+Sprint 3 (consultations, chat, payments, notifications) is in consult.py and Sprint 4 (rent agreements,
+saved searches, reports) is in sprint4.py. Both use the same router.
+
 Each handler checks the caller's role on the server, so hiding a menu item in
 the browser is never the only protection (PB-02, PB-03).
 """
@@ -10,9 +13,10 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from . import db
+from . import db, reports
 from .db import (
-    CHECKLIST_ITEMS, DOCUMENT_TYPES, OPEN_REQUEST_STATUSES, PROPERTY_TYPES, REQUIRED_DOCUMENT_TYPES, USER_SELECT, audit, utc_now,
+    CHECKLIST_ITEMS, DOCUMENT_TYPES, OPEN_REQUEST_STATUSES, PROPERTY_TYPES, REQUIRED_DOCUMENT_TYPES, USER_SELECT, audit, notify, notify_advocates,
+    utc_now,
 )
 from .security import (
     DUMMY_PASSWORD_HASH,
@@ -261,6 +265,9 @@ def check_advocate_fields(checker):
     return checker.done()
 
 
+DEFAULT_CONSULTATION_FEE = 500  # taka, for one paid consultation (PB-22)
+
+
 def create_advocate(connection, data, verification_status, added_by=None):
     """Create an advocate account with its profile. Returns the new user id."""
     conflicts = {}
@@ -277,9 +284,11 @@ def create_advocate(connection, data, verification_status, added_by=None):
         (data["fullName"], data["email"], data["phone"], hash_password(data["password"]), now),
     )
     connection.execute(
-        """INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_by, added_at, verification_status)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (cursor.lastrowid, data["barCouncilId"], data["specialization"], added_by, now, verification_status),
+        """INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_by, added_at, verification_status,
+                                          consultation_fee)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (cursor.lastrowid, data["barCouncilId"], data["specialization"], added_by, now, verification_status,
+         DEFAULT_CONSULTATION_FEE),
     )
     return cursor.lastrowid
 
@@ -840,6 +849,7 @@ def reply_inquiry(request):
 
 REQUEST_SELECT = f"""
 SELECT vr.*, p.title, p.area_name, p.city, p.address, p.listing_type, p.property_type, p.listing_status,
+       p.badge_level, p.verification_status AS property_verification,
        o.full_name AS owner_name, a.full_name AS advocate_name,
        {HIGH_DEMAND_SQL} AS is_high_demand,
        (SELECT COUNT(DISTINCT d.document_type) FROM legal_documents d
@@ -908,6 +918,10 @@ def request_detail_json(connection, row, user):
     )
     data["advocateNotes"] = row["advocate_notes"]
     data["checklist"] = json.loads(row["checklist"]) if row["checklist"] else None
+    # PB-19: the advocate who verified the listing can raise its badge level.
+    is_current = row["status"] == "document_verified" and row["property_verification"] == "document_verified"
+    data["badgeLevel"] = row["badge_level"] if is_current else None
+    data["canSetBadgeLevel"] = is_current and user["role"] == "advocate" and row["advocate_id"] == user["id"]
     documents = connection.execute(
         "SELECT * FROM legal_documents WHERE request_id = ? ORDER BY uploaded_at DESC, id DESC", (row["id"],)
     ).fetchall()
@@ -942,6 +956,9 @@ def create_verification_request(connection, user, property_row):
     )
     audit(connection, user["id"], "verification_requested", "verification_request", cursor.lastrowid, None, "pending",
           f"Property #{property_row['id']}: {property_row['title']}")
+    notify_advocates(connection, "verification_request", "New verification request",
+                     f"{property_row['title']} in {property_row['area_name']} is waiting in the queue.",
+                     f"/advocate/requests/{cursor.lastrowid}")
     return cursor.lastrowid
 
 
@@ -1155,7 +1172,56 @@ def decide_request(request):
     audit(connection, user["id"], "verification_status_changed", "verification_request", row["id"], "in_review", decision,
           cleaned["notes"])
     set_property_verification(connection, user["id"], row["property_id"], decision, f"Decision on request #{row['id']}")
+    if decision == "document_verified":
+        reports.ensure_report(connection, row["id"])  # PB-18: the legal report is created with the decision
+        sprint4.alert_saved_searches(connection, row["property_id"])  # PB-28: tell buyers whose saved search matches
+        notify(connection, row["owner_id"], "verification_result", "Your property is Document Verified",
+               f"{row['title']} now shows the Verified badge. Buyers can download its legal report.",
+               f"/owner/verification/{row['id']}")
+    else:
+        notify(connection, row["owner_id"], "verification_result", "An issue was found in your papers",
+               f"{row['title']}: read the advocate's notes and upload a corrected paper.",
+               f"/owner/verification/{row['id']}")
     return request_detail_json(connection, load_request(connection, row["id"]), user)
+
+
+@router.route("POST", "/api/verification-requests/{id}/badge-level")
+def set_badge_level(request):
+    """PB-19: the advocate who verified a listing sets how much checking was done."""
+    user = request.require("advocate")
+    connection = request.connection
+    row = load_request(connection, request.params["id"])
+    if row["advocate_id"] != user["id"]:
+        raise ApiError(403, "Only the advocate who verified this listing can change its badge level.")
+    if row["status"] != "document_verified" or row["property_verification"] != "document_verified":
+        raise ApiError(409, "A badge level can only be set on a verified listing.")
+    checker = Checker(request.json())
+    level = checker.choice("level", "Badge level", reports.BADGE_LEVELS)
+    checker.done()
+    if level != row["badge_level"]:
+        connection.execute("UPDATE properties SET badge_level = ?, updated_at = ? WHERE id = ?", (level, utc_now(), row["property_id"]))
+        reports.set_report_level(connection, row["id"], level)
+        audit(connection, user["id"], "badge_level_changed", "property", row["property_id"], row["badge_level"], level,
+              f"Set on request #{row['id']}")
+        notify(connection, row["owner_id"], "verification_result", f"Badge level: {reports.BADGE_LABELS[level]}",
+               f"{row['title']} now shows the {reports.BADGE_LABELS[level]} badge.", f"/property/{row['property_id']}")
+    return request_detail_json(connection, load_request(connection, row["id"]), user)
+
+
+@router.route("GET", "/api/properties/{id}/legal-report")
+def download_legal_report(request):
+    """PB-18: anyone looking at a verified listing can download its plain-language report."""
+    row = fetch_property(request.connection, request.params["id"])
+    report = None
+    if row is not None and row["listing_status"] == "active" and row["verification_status"] == "document_verified":
+        report = reports.current_report(request.connection, row["id"])
+    if report is None:
+        raise ApiError(404, "This listing has no legal report. Reports are made when an advocate verifies a property.")
+    return Response(
+        body=reports.report_pdf(report),
+        content_type="application/pdf",
+        headers=[("Content-Disposition", f'inline; filename="PFB-legal-report-{row["id"]}.pdf"')],
+    )
 
 
 # ---------------------------------------------------------------- admin (PB-04, PB-16, PB-17)
@@ -1259,6 +1325,8 @@ def send_advocate_appointment(request):
     )
     audit(connection, admin["id"], "advocate_appointment_sent", "user", row["id"], row["advocate_status"], "appointment_sent",
           f"{row['full_name']}: {appointment_at.replace('T', ' ')} at {cleaned['place']}")
+    notify(connection, row["id"], "advocate_account", "You have an appointment",
+           f"{consult.nice_time(appointment_at)}, {cleaned['place']}", "/advocate/application")
     return {"advocate": advocate_json(load_advocate(connection, row["id"]))}
 
 
@@ -1284,6 +1352,11 @@ def decide_advocate(request):
     )
     audit(connection, admin["id"], "advocate_verification_changed", "user", row["id"], row["advocate_status"], decision,
           f"{row['full_name']}: {note}" if note else row["full_name"])
+    if decision == "verified":
+        notify(connection, row["id"], "advocate_account", "Your advocate account is verified",
+               "You can now open the verification queue and answer consultations.", "/advocate")
+    else:
+        notify(connection, row["id"], "advocate_account", "Your application was not approved", note or "", "/advocate/application")
     return {"advocate": advocate_json(load_advocate(connection, row["id"]))}
 
 
@@ -1388,3 +1461,7 @@ def admin_audit_log(request):
     sql = AUDIT_SELECT + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY a.id DESC LIMIT ?"
     rows = request.connection.execute(sql, (*params, limit)).fetchall()
     return {"entries": [audit_json(row) for row in rows]}
+
+
+# Sprint 3 routes register themselves on the router above. Imported last because consult.py uses the helpers here.
+from . import consult, sprint4  # noqa: E402, F401

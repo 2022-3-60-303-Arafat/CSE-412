@@ -10,6 +10,8 @@ import * as owner from './views/owner.js';
 import * as buyer from './views/buyer.js';
 import * as review from './views/review.js';
 import * as admin from './views/admin.js';
+import * as consult from './views/consult.js';
+import * as agreements from './views/agreements.js';
 
 export const session = { user: null, meta: { cities: [], propertyTypes: [], areas: [], documentTypes: [] } };
 
@@ -31,15 +33,22 @@ const routes = [
   { path: '/owner/verification/:id', view: owner.renderVerification, roles: ['owner'] },
   { path: '/advocate', view: review.renderQueue, roles: ['advocate'], verifiedOnly: true },
   { path: '/advocate/requests/:id', view: review.renderRequest, roles: ['advocate'], verifiedOnly: true },
+  { path: '/consultations', view: consult.renderList, roles: ['buyer_tenant', 'advocate'], verifiedOnly: true },
+  { path: '/consultations/new', view: consult.renderBooking, roles: ['buyer_tenant'] },
+  { path: '/consultations/:id', view: consult.renderDetail, roles: ['buyer_tenant', 'advocate'], verifiedOnly: true },
+  { path: '/notifications', view: consult.renderNotifications, roles: ['buyer_tenant', 'owner', 'advocate', 'admin'] },
+  { path: '/agreements', view: agreements.renderList, roles: ['owner', 'buyer_tenant', 'advocate', 'admin'], verifiedOnly: true },
+  { path: '/agreements/new', view: agreements.renderNew, roles: ['owner'] },
+  { path: '/agreements/:id', view: agreements.renderDetail, roles: ['owner', 'buyer_tenant', 'advocate', 'admin'], verifiedOnly: true },
   { path: '/admin', view: admin.render, roles: ['admin'] },
   { path: '/admin/requests/:id', view: review.renderRequest, roles: ['admin'] },
 ];
 
 const MENUS = {
   guest: [['/', 'Find homes'], ['/calculator', 'Calculators']],
-  buyer_tenant: [['/', 'Find homes'], ['/favorites', 'Saved homes'], ['/inquiries', 'My inquiries'], ['/history', 'History'], ['/calculator', 'Calculators']],
-  owner: [['/', 'Find homes'], ['/owner/listings', 'My listings'], ['/inquiries', 'Inquiries'], ['/history', 'History'], ['/calculator', 'Calculators']],
-  advocate: [['/advocate', 'Verification queue'], ['/', 'Browse listings']],
+  buyer_tenant: [['/', 'Find homes'], ['/favorites', 'Saved'], ['/inquiries', 'Inquiries'], ['/consultations', 'Consultations'], ['/agreements', 'Agreements'], ['/history', 'History'], ['/calculator', 'Calculators']],
+  owner: [['/', 'Find homes'], ['/owner/listings', 'My listings'], ['/inquiries', 'Inquiries'], ['/agreements', 'Agreements'], ['/history', 'History'], ['/calculator', 'Calculators']],
+  advocate: [['/advocate', 'Verification queue'], ['/consultations', 'Consultations'], ['/agreements', 'Agreements'], ['/', 'Browse listings']],
   advocate_unverified: [['/advocate/application', 'My application'], ['/', 'Browse listings']],
   admin: [['/admin', 'Admin panel'], ['/', 'Browse listings']],
 };
@@ -79,7 +88,10 @@ function renderNav(path) {
     ${links.map(([href, label]) => html`<a href="#${href}" class="${path === href ? 'active' : ''}">${label}</a>`)}
     <span class="nav-spacer"></span>
     ${user ? html`
-      ${user.role === 'owner' ? html`<a class="btn btn-accent btn-small" href="#/owner/listings/new">+ List a property</a>` : ''}
+      <a class="bell ${path === '/notifications' ? 'active' : ''}" href="#/notifications" aria-label="Notifications" title="Notifications">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0c0 6 2.5 7 2.5 7h-17S6 15 6 9z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>
+        <span class="bell-count" id="bell-count" hidden></span>
+      </a>
       <span class="nav-user">
         <span class="who">${user.fullName}<small>${ROLE_LABELS[user.role]}${isUnverifiedAdvocate(user) ? ' (not verified)' : ''}</small></span>
         <button class="btn btn-outline btn-small" type="button" data-logout>Log out</button>
@@ -87,6 +99,25 @@ function renderNav(path) {
       <a href="#/login" class="${path === '/login' ? 'active' : ''}">Log in</a>
       <a class="btn btn-primary btn-small" href="#/signup">Sign up</a>`}
   `);
+}
+
+// PB-25: the bell in the menu shows how many notifications are unread.
+let unreadCount = 0;
+function showBell() {
+  const count = $('#bell-count');
+  if (!count) return;
+  count.textContent = unreadCount > 99 ? '99+' : String(unreadCount);
+  count.hidden = unreadCount === 0;
+  count.parentElement.setAttribute('aria-label', unreadCount ? `Notifications, ${unreadCount} unread` : 'Notifications');
+}
+export async function updateBell() {
+  if (!session.user) return;
+  try {
+    ({ unread: unreadCount } = await api.get('/api/notifications?count=1'));
+    showBell();
+  } catch {
+    // The bell is a convenience; a failed check must not break the page.
+  }
 }
 
 function forbidden(roles) {
@@ -104,6 +135,8 @@ export async function route() {
   const { path, query } = parseHash();
   const ticket = ++renderCount;
   renderNav(path);
+  showBell();
+  updateBell();
   $('#site-nav').classList.remove('open');
   $('.menu-toggle').setAttribute('aria-expanded', 'false');
 

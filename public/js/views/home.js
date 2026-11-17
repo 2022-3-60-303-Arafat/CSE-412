@@ -1,7 +1,7 @@
 // Home page: search with Sale/Rent, price or rent range, bedrooms and Verified-only filters (PB-07, PB-15).
 
 import { api } from '../api.js';
-import { $, errorPanel, html, mount, photo, priceLine, showErrors, taka, verificationBadge, loading } from '../ui.js';
+import { $, errorPanel, html, mount, photo, priceLine, showErrors, taka, toast, verificationBadge, loading } from '../ui.js';
 
 // Homes shown before the visitor asks for the rest, so the page does not start as one long list.
 const FIRST_PAGE = 12;
@@ -11,10 +11,10 @@ const FILTER_KEYS =['purpose', 'area', 'type', 'minPrice', 'maxPrice', 'bedrooms
 export function propertyCard(property, source = 'search') {
   return html`<a class="property-card" href="#/property/${property.id}?from=${source}">
     <div class="card-photo">
-      ${photo(property, `${property.title} in ${property.areaName}`)}
+      ${photo(property, `${property.title} in ${property.areaName}`, 640)}
       <div class="card-labels">
         <span class="badge badge-${property.listingType}">${property.listingType === 'rent' ? 'For rent' : 'For sale'}</span>
-        ${verificationBadge(property.verificationStatus)}
+        ${verificationBadge(property.verificationStatus, property.badgeLevel)}
       </div>
     </div>
     <div class="card-body">
@@ -194,6 +194,8 @@ export async function render({ root, query, session }) {
         <div class="results-head">
           <h2>${total} ${total === 1 ? 'home' : 'homes'} ${purposeWord}</h2>
           ${values.verified ? html`<span class="badge badge-verified">Showing verified listings only</span>` : ''}
+          ${user?.role === 'buyer_tenant' ? html`<button class="btn btn-outline btn-small save-search" type="button" data-save-search>
+            Save this search<span class="hint"> · get an alert for new verified homes</span></button>` : ''}
         </div>
         ${total ? html`
           <div class="card-grid">${properties.slice(0, FIRST_PAGE).map(card => propertyCard(card))}</div>
@@ -258,8 +260,20 @@ export async function render({ root, query, session }) {
     if (['purpose', 'verified', 'sort', 'type', 'bedrooms'].includes(event.target.name)) load();
   });
   $('#clear-search', root).addEventListener('click', clearSearch);
-  results.addEventListener('click', event => {
+  results.addEventListener('click', async event => {
     if (event.target.closest('[data-clear]')) clearSearch();
+    const save = event.target.closest('[data-save-search]');
+    if (save) {
+      save.disabled = true;
+      try {
+        await api.post('/api/saved-searches', { filters: currentFilters() });
+        save.textContent = 'Search saved ✓';
+        toast('Search saved. You will get a notification when a new verified home matches it.');
+      } catch (error) {
+        toast(error.message, true);
+        save.disabled = false;
+      }
+    }
     const more = event.target.closest('[data-show-more]');
     if (more) {
       $('.more-cards', results).hidden = false;

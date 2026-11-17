@@ -17,7 +17,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
@@ -716,6 +716,483 @@ class BrowsingHistoryTests(ApiTestCase):
         with contextlib.closing(sqlite3.connect(old)) as connection:
             self.assertEqual(connection.execute("SELECT verification_status FROM advocate_profiles").fetchone()[0], "verified")
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+
+
+class Sprint3Tests(ApiTestCase):
+    """Legal reports, badge levels, Ask an Advocate, chat, paid consultations and notifications (PB-18 to PB-25)."""
+
+    VERIFIED = "A quiet home above the city"      # verified by advocate@pfb.test
+    UNVERIFIED = "Light-filled corner apartment"
+
+    def advocate_id(self, email="advocate@pfb.test"):
+        with self.db() as connection:
+            return connection.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()[0]
+
+    def verify_new_listing(self):
+        """An owner lists a home, uploads the papers and an advocate verifies it. Returns (listing id, request id)."""
+        owner = self.client("owner@pfb.test")
+        _, body = owner.post("/api/properties", rent_listing(requestVerification=True))
+        listing_id, request_id = body["property"]["id"], body["verificationRequestId"]
+        for document_type in ("land_deed", "mutation", "tax_receipt"):
+            owner.upload(request_id, document_type, f"{document_type}.pdf", sample_pdf([document_type]))
+        advocate = self.client("advocate@pfb.test")
+        advocate.post(f"/api/verification-requests/{request_id}/start-review")
+        status, body = advocate.post(f"/api/verification-requests/{request_id}/decision", {
+            "decision": "document_verified", "notes": "All papers are in order.",
+            "checklist": {"land_deed": "ok", "mutation": "ok", "tax_receipt": "ok", "ownership_history": "ok"},
+        })
+        self.assertEqual(status, 200, body)
+        return listing_id, request_id
+
+    def book(self, client, slot_index=0, email="advocate@pfb.test"):
+        advocate_id = self.advocate_id(email)
+        slots = client.get(f"/api/advocates/{advocate_id}/slots")[1]["slots"]
+        return client.post("/api/consultations", {
+            "propertyId": self.property_id(self.VERIFIED), "advocateId": advocate_id, "slotStart": slots[slot_index],
+        }), slots[slot_index]
+
+    def test_pb18_legal_report_pdf_is_created_when_a_property_is_verified(self):
+        listing_id, request_id = self.verify_new_listing()
+        with self.db() as connection:
+            report = connection.execute("SELECT * FROM verification_reports WHERE request_id = ?", (request_id,)).fetchone()
+        self.assertIsNotNone(report)
+        self.assertEqual(report["badge_level"], "document_verified")
+        self.assertIn("not a legal opinion", report["disclaimer_text"])
+        # A visitor who is not logged in can download it from the listing.
+        status, pdf = self.client().get(f"/api/properties/{listing_id}/legal-report")
+        self.assertEqual(status, 200)
+        self.assertTrue(pdf.startswith(b"%PDF-") and pdf.rstrip().endswith(b"%%EOF"))
+        for text in (b"Property legal report", b"Land deed: In order", b"Mutation paper", b"Land development tax receipt: In order",
+                     b"Ownership history: In order", b"Result: Document Verified", b"Disclaimer", b"Adv. Sarah Rahman",
+                     datetime.now(timezone(timedelta(hours=6))).date().isoformat().encode()):
+            self.assertIn(text, pdf)
+        # Listings that are not verified have no report.
+        self.assertEqual(self.client().get(f"/api/properties/{self.property_id(self.UNVERIFIED)}/legal-report")[0], 404)
+        self.assertEqual(self.client().get(f"/api/properties/{self.property_id('A family home with room to grow')}/legal-report")[0], 404)
+
+    def test_pb19_advocate_sets_badge_level_and_listing_and_report_show_it(self):
+        listing_id, request_id = self.verify_new_listing()
+        advocate = self.client("advocate@pfb.test")
+        self.assertEqual(advocate.get(f"/api/verification-requests/{request_id}")[1]["canSetBadgeLevel"], True)
+        self.assertEqual(advocate.post(f"/api/verification-requests/{request_id}/badge-level", {"level": "gold"})[0], 400)
+        status, body = advocate.post(f"/api/verification-requests/{request_id}/badge-level", {"level": "site_visited"})
+        self.assertEqual((status, body["badgeLevel"]), (200, "site_visited"), body)
+        listing = self.client().get(f"/api/properties/{listing_id}")[1]
+        self.assertEqual((listing["verificationStatus"], listing["badgeLevel"]), ("document_verified", "site_visited"))
+        self.assertIn(b"Result: Site Visited", self.client().get(f"/api/properties/{listing_id}/legal-report")[1])
+        advocate.post(f"/api/verification-requests/{request_id}/badge-level", {"level": "fully_verified"})
+        self.assertIn(b"Result: Fully Verified", self.client().get(f"/api/properties/{listing_id}/legal-report")[1])
+        # Only the advocate who verified it can change the level, and only on a verified listing.
+        url = f"/api/verification-requests/{request_id}/badge-level"
+        for email in ("advocate2@pfb.test", "owner@pfb.test", "admin@pfb.test"):
+            self.assertEqual(self.client(email).post(url, {"level": "document_verified"})[0], 403, email)
+        pending = self.request_id("Easy, airy living by the lake")
+        advocate.post(f"/api/verification-requests/{pending}/start-review")
+        self.assertEqual(advocate.post(f"/api/verification-requests/{pending}/badge-level", {"level": "site_visited"})[0], 409)
+        # Demo data has one listing of each higher level.
+        levels = {p["badgeLevel"] for p in self.client().get("/api/properties?verified=1")[1]["properties"]}
+        self.assertEqual(levels, {"document_verified", "site_visited", "fully_verified"})
+
+    def test_pb20_ask_an_advocate_only_on_verified_listings_for_buyers(self):
+        tenant = self.client("tenant2@pfb.test")
+        verified, unverified = self.property_id(self.VERIFIED), self.property_id(self.UNVERIFIED)
+        status, body = tenant.get(f"/api/properties/{verified}/chat")
+        self.assertEqual((status, body["consultation"]), (200, None))
+        self.assertEqual(body["advocate"]["name"], "Adv. Sarah Rahman")  # the advocate who verified this listing
+        self.assertEqual(tenant.get(f"/api/properties/{unverified}/chat")[0], 409)
+        self.assertEqual(tenant.post(f"/api/properties/{unverified}/chat", {"body": "Is this safe to buy?"})[0], 409)
+        status, body = tenant.post("/api/consultations", {
+            "propertyId": unverified, "advocateId": self.advocate_id(), "slotStart": "2030-01-01T10:00"})
+        self.assertEqual(status, 409)
+        # The two choices: a free question needs no fee, a paid booking shows advocates with their fee.
+        advocates = tenant.get("/api/advocates")[1]["advocates"]
+        self.assertEqual({a["name"]: a["fee"] for a in advocates}, {"Adv. Sarah Rahman": 500, "Adv. Mahmud Karim": 700})
+        for client in (self.client(), self.client("owner@pfb.test")):
+            self.assertIn(client.get(f"/api/properties/{verified}/chat")[0], (401, 403))
+            self.assertIn(client.get("/api/advocates")[0], (401, 403))
+
+    def test_pb21_chat_messages_are_saved_and_the_advocate_can_reply(self):
+        tenant = self.client("tenant2@pfb.test")
+        listing_id = self.property_id(self.VERIFIED)
+        self.assertEqual(tenant.post(f"/api/properties/{listing_id}/chat", {"body": ""})[0], 400)
+        status, chat = tenant.post(f"/api/properties/{listing_id}/chat", {"body": "Is the mutation paper up to date?"})
+        self.assertEqual((status, chat["kind"], chat["state"], chat["fee"]), (201, "free_chat", "chat", 0), chat)
+        advocate = self.client("advocate@pfb.test")
+        self.assertIn(chat["id"], [c["id"] for c in advocate.get("/api/consultations")[1]["consultations"]])
+        status, body = advocate.post(f"/api/consultations/{chat['id']}/messages", {"body": "Yes, it was renewed this year."})
+        self.assertEqual(status, 201, body)
+        tenant.post(f"/api/properties/{listing_id}/chat", {"body": "Thank you."})
+        # The history stays with the property page, in order, in one thread.
+        thread = tenant.get(f"/api/properties/{listing_id}/chat")[1]["consultation"]
+        self.assertEqual(thread["id"], chat["id"])
+        self.assertEqual([m["body"] for m in thread["messages"]],
+                         ["Is the mutation paper up to date?", "Yes, it was renewed this year.", "Thank you."])
+        self.assertEqual([m["senderName"] for m in thread["messages"]], ["Sumaiya Islam", "Adv. Sarah Rahman", "Sumaiya Islam"])
+        # Nobody else can read or write in the chat.
+        for email in ("tenant@pfb.test", "advocate2@pfb.test"):
+            other = self.client(email)
+            self.assertEqual(other.get(f"/api/consultations/{chat['id']}")[0], 403)
+            self.assertEqual(other.post(f"/api/consultations/{chat['id']}/messages", {"body": "Let me in"})[0], 403)
+        self.assertEqual(self.client("owner@pfb.test").get(f"/api/consultations/{chat['id']}")[0], 403)
+
+    def test_pb22_buyer_books_a_free_slot_and_it_cannot_be_booked_twice(self):
+        tenant = self.client("tenant@pfb.test")
+        advocate_id = self.advocate_id()
+        slots = tenant.get(f"/api/advocates/{advocate_id}/slots")[1]["slots"]
+        self.assertGreater(len(slots), 10)
+        self.assertEqual(slots, sorted(set(slots)))
+        with self.db() as connection:
+            taken = [row[0] for row in connection.execute(
+                "SELECT slot_start FROM consultations WHERE advocate_id = ? AND status IN ('requested', 'confirmed') "
+                "AND slot_start IS NOT NULL", (advocate_id,))]
+        self.assertTrue(taken)
+        self.assertFalse(set(taken) & set(slots))  # slots already asked for are not offered
+        for slot in slots:
+            self.assertNotEqual(date.fromisoformat(slot[:10]).weekday(), 4)  # closed on Fridays
+
+        (status, booking), slot = self.book(tenant)
+        self.assertEqual((status, booking["state"], booking["slotStart"], booking["fee"]), (201, "awaiting_advocate", slot, 500), booking)
+        self.assertNotIn(slot, tenant.get(f"/api/advocates/{advocate_id}/slots")[1]["slots"])
+        payload = {"propertyId": self.property_id(self.VERIFIED), "advocateId": advocate_id, "slotStart": slot}
+        status, body = self.client("tenant2@pfb.test").post("/api/consultations", payload)
+        self.assertEqual(status, 409)
+        self.assertIn("slotStart", body["fields"])
+        # Times that are not real slots are refused too.
+        for bad in ("2020-01-01T10:00", slot[:11] + "03:00", "tomorrow"):
+            self.assertIn(tenant.post("/api/consultations", {**payload, "slotStart": bad})[0], (400, 409), bad)
+        # The same time is still free with another advocate; cancelling gives a slot back.
+        self.assertIn(slot, tenant.get(f"/api/advocates/{self.advocate_id('advocate2@pfb.test')}/slots")[1]["slots"])
+        self.assertEqual(tenant.post(f"/api/consultations/{booking['id']}/cancel")[1]["state"], "cancelled")
+        self.assertIn(slot, tenant.get(f"/api/advocates/{advocate_id}/slots")[1]["slots"])
+
+    def test_pb23_advocate_confirms_or_refuses_and_adds_follow_up_notes(self):
+        tenant = self.client("tenant@pfb.test")
+        advocate = self.client("advocate@pfb.test")
+        (_, first), _ = self.book(tenant, 0)
+        (_, second), second_slot = self.book(tenant, 1)
+        # Only the advocate who was asked can answer.
+        for client in (tenant, self.client("advocate2@pfb.test")):
+            self.assertEqual(client.post(f"/api/consultations/{first['id']}/respond", {"decision": "confirmed"})[0], 403)
+        self.assertEqual(advocate.post(f"/api/consultations/{second['id']}/respond", {"decision": "refused"})[0], 400)
+        status, body = advocate.post(f"/api/consultations/{second['id']}/respond", {"decision": "refused", "reason": "I am in court that morning."})
+        self.assertEqual((status, body["state"]), (200, "refused"))
+        self.assertIn(second_slot, tenant.get(f"/api/advocates/{self.advocate_id()}/slots")[1]["slots"])  # slot is free again
+        status, body = advocate.post(f"/api/consultations/{first['id']}/respond", {"decision": "confirmed"})
+        self.assertEqual((status, body["state"]), (200, "awaiting_payment"))
+        self.assertEqual(advocate.post(f"/api/consultations/{first['id']}/respond", {"decision": "refused", "reason": "Changed my mind"})[0], 409)
+
+        # Notes come after the session, so the booking must be paid first.
+        notes = "Ask for the original deed and the latest tax receipt before paying."
+        self.assertEqual(advocate.post(f"/api/consultations/{first['id']}/complete", {"notes": notes})[0], 409)
+        tenant.post(f"/api/consultations/{first['id']}/pay", {"method": "bkash", "account": "01712345678"})
+        self.assertEqual(advocate.post(f"/api/consultations/{first['id']}/complete", {"notes": "short"})[0], 400)
+        self.assertEqual(tenant.post(f"/api/consultations/{first['id']}/complete", {"notes": notes})[0], 403)
+        status, body = advocate.post(f"/api/consultations/{first['id']}/complete", {"notes": notes})
+        self.assertEqual((status, body["state"]), (200, "completed"))
+        # The notes show in the buyer's dashboard.
+        mine = {c["id"]: c for c in tenant.get("/api/consultations")[1]["consultations"]}
+        self.assertEqual((mine[first["id"]]["state"], mine[first["id"]]["followUpNotes"]), ("completed", notes))
+        self.assertEqual(mine[second["id"]]["followUpNotes"], "I am in court that morning.")
+
+    def test_pb24_payment_confirms_the_booking_and_a_failed_payment_is_clear(self):
+        tenant = self.client("tenant@pfb.test")
+        advocate = self.client("advocate@pfb.test")
+        (_, booking), _ = self.book(tenant)
+        pay_url = f"/api/consultations/{booking['id']}/pay"
+        good = {"method": "bkash", "account": "01712345678"}
+        self.assertEqual(tenant.post(pay_url, good)[0], 409)  # the advocate has not accepted yet
+        advocate.post(f"/api/consultations/{booking['id']}/respond", {"decision": "confirmed"})
+        for bad in ({"method": "cash", "account": "01712345678"}, {"method": "bkash", "account": "12345"}, {"method": "card", "account": "4111"}):
+            status, body = tenant.post(pay_url, bad)
+            self.assertEqual(status, 400, bad)
+            self.assertTrue(body["fields"])
+        self.assertEqual(self.client("tenant2@pfb.test").post(pay_url, good)[0], 403)
+
+        status, body = tenant.post(pay_url, {"method": "nagad", "account": "01712340000"})
+        self.assertEqual(status, 402)
+        self.assertIn("Payment failed", body["error"])
+        self.assertIn("No money was taken", body["error"])
+        self.assertEqual(tenant.get(f"/api/consultations/{booking['id']}")[1]["state"], "awaiting_payment")
+
+        status, body = tenant.post(pay_url, {"method": "card", "account": "4111 1111 1111 1111"})
+        self.assertEqual((status, body["state"]), (200, "booked"), body)
+        receipt = body["receipt"]
+        self.assertEqual((receipt["amount"], receipt["method"]), (500, "Card"))
+        self.assertRegex(receipt["transactionRef"], r"^PFB-[0-9A-F]{10}$")
+        self.assertTrue(receipt["paidAt"])
+        self.assertEqual(tenant.post(pay_url, good)[0], 409)  # cannot pay twice
+        self.assertEqual(tenant.post(f"/api/consultations/{booking['id']}/cancel")[0], 409)
+        with self.db() as connection:
+            payments = [tuple(row) for row in connection.execute(
+                "SELECT status, method, amount FROM payments WHERE consultation_id = ? ORDER BY id", (booking["id"],))]
+        self.assertEqual(payments, [("failed", "nagad", 500), ("paid", "card", 500)])
+        self.assertEqual(advocate.get(f"/api/consultations/{booking['id']}")[1]["receipt"]["transactionRef"], receipt["transactionRef"])
+
+    def test_pb25_notifications_for_verification_results_and_new_requests(self):
+        owner = self.client("owner@pfb.test")
+        advocate = self.client("advocate@pfb.test")
+        advocate.post("/api/notifications/read", {"all": True})
+        owner.post("/api/notifications/read", {"all": True})
+        self.assertEqual(owner.get("/api/notifications?count=1")[1], {"unread": 0})
+
+        listing_id, request_id = self.verify_new_listing()
+        # Advocates are told about the new request (both of them, but not the applicant who is not verified).
+        # The demo data already holds one such notification for the first advocate.
+        for email, expected in (("advocate@pfb.test", 2), ("advocate2@pfb.test", 1), ("applicant@pfb.test", 0)):
+            titles = [n["title"] for n in self.client(email).get("/api/notifications")[1]["notifications"]]
+            self.assertEqual(titles.count("New verification request"), expected, email)
+        # The owner is told about the result, with a link to the request.
+        status, body = owner.get("/api/notifications")
+        self.assertEqual((status, body["unread"]), (200, 1))
+        latest = body["notifications"][0]
+        self.assertEqual((latest["title"], latest["isRead"], latest["link"]),
+                         ("Your property is Document Verified", False, f"/owner/verification/{request_id}"))
+        # Marking it read lowers the bell count; a user cannot mark someone else's notification.
+        self.assertEqual(advocate.post("/api/notifications/read", {"id": latest["id"]})[1]["unread"], 1)
+        self.assertEqual(owner.get("/api/notifications?count=1")[1], {"unread": 1})
+        self.assertEqual(owner.post("/api/notifications/read", {"id": latest["id"]})[1], {"unread": 0})
+        self.assertEqual(self.client().get("/api/notifications")[0], 401)
+
+        # An issue found is reported to the owner too.
+        issue_request = self.request_id("Easy, airy living by the lake")
+        advocate.post(f"/api/verification-requests/{issue_request}/start-review")
+        advocate.post(f"/api/verification-requests/{issue_request}/decision", {
+            "decision": "issue_found", "notes": "The tax receipt is out of date.",
+            "checklist": {"land_deed": "ok", "mutation": "ok", "tax_receipt": "problem", "ownership_history": "ok"},
+        })
+        self.assertEqual(owner.get("/api/notifications")[1]["notifications"][0]["title"], "An issue was found in your papers")
+
+        # Consultation requests reach the advocate, and the answer reaches the buyer.
+        tenant = self.client("tenant2@pfb.test")
+        (_, booking), _ = self.book(tenant)
+        note = advocate.get("/api/notifications")[1]["notifications"][0]
+        self.assertEqual((note["title"], note["link"]), ("New consultation request", f"/consultations/{booking['id']}"))
+        advocate.post(f"/api/consultations/{booking['id']}/respond", {"decision": "confirmed"})
+        self.assertEqual(tenant.get("/api/notifications")[1]["notifications"][0]["title"], "Your consultation was accepted")
+
+    def test_sprint3_demo_data_and_upgrade_from_an_older_database(self):
+        tenant = self.client("tenant@pfb.test")
+        states = sorted(c["state"] for c in tenant.get("/api/consultations")[1]["consultations"])
+        self.assertEqual(states, ["awaiting_payment", "booked", "chat"])
+        self.assertEqual(sorted(c["state"] for c in self.client("tenant2@pfb.test").get("/api/consultations")[1]["consultations"]),
+                         ["awaiting_advocate", "completed"])
+        self.assertGreater(tenant.get("/api/notifications?count=1")[1]["unread"], 0)
+
+        old = Path(self.temp.name) / "old.sqlite3"
+        connection = sqlite3.connect(old)
+        connection.executescript(db.SCHEMA + db.HISTORY_SCHEMA + db.ADVOCATE_VERIFICATION_SCHEMA)
+        connection.execute("INSERT INTO users (full_name, email, phone, password_hash, role, created_at) "
+                           "VALUES ('Adv. Old', 'old@example.com', '01711111111', 'x', 'advocate', '2026-01-01')")
+        connection.execute("INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_at) "
+                           "VALUES (1, 'DBC-1', 'Land', '2026-01-01')")
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+        connection.close()
+        self.assertFalse(db.initialize(old))
+        with contextlib.closing(sqlite3.connect(old)) as connection:
+            self.assertEqual(connection.execute("SELECT consultation_fee FROM advocate_profiles").fetchone()[0], 500)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 0)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+
+
+class Sprint4Tests(ApiTestCase):
+    """Rent agreements, saved searches with alerts, the admin report and listing reports (PB-26 to PB-33)."""
+
+    RENT_LISTING = "Easy, airy living by the lake"   # owner@pfb.test, for rent, minimum lease 12 months
+    SALE_LISTING = "Light-filled corner apartment"   # owner@pfb.test, for sale
+
+    def new_agreement(self, **overrides):
+        data = {"tenantEmail": "tenant2@pfb.test", "startDate": (date.today() + timedelta(days=10)).isoformat(),
+                "leaseMonths": 12, "specialTerms": "No smoking inside the flat."}
+        data.update(overrides)
+        return self.client("owner@pfb.test").post(f"/api/properties/{self.property_id(self.RENT_LISTING)}/agreements", data)
+
+    def test_pb26_agreement_is_filled_from_the_listing_and_downloads_as_pdf(self):
+        owner = self.client("owner@pfb.test")
+        status, body = self.new_agreement()
+        self.assertEqual(status, 201, body)
+        with self.db() as connection:
+            rent = connection.execute("SELECT * FROM rent_details WHERE property_id = ?", (self.property_id(self.RENT_LISTING),)).fetchone()
+        start = date.fromisoformat(body["startDate"])
+        self.assertEqual((body["status"], body["landlord"]["name"], body["tenant"]["name"]), ("draft", "Nadia Rahman", "Sumaiya Islam"))
+        self.assertEqual((body["monthlyRent"], body["securityDeposit"]), (rent["monthly_rent"], rent["security_deposit"]))
+        self.assertEqual(body["endDate"], (date(start.year + 1, start.month, start.day) - timedelta(days=1)).isoformat())
+        status, pdf = owner.get(f"/api/agreements/{body['id']}/pdf")
+        self.assertEqual(status, 200)
+        self.assertTrue(pdf.startswith(b"%PDF-"))
+        for text in (b"Rent agreement", b"Nadia Rahman", b"Sumaiya Islam", f"Tk {rent['monthly_rent']:,}".encode(),
+                     body["startDate"].encode(), body["endDate"].encode(), b"No smoking inside the flat.", b"DRAFT"):
+            self.assertIn(text, pdf)
+        # Bad input is refused with clear messages.
+        status, body = self.new_agreement(tenantEmail="owner2@pfb.test", leaseMonths=3, startDate="2020-01-01")
+        self.assertEqual(status, 400)
+        self.assertEqual(set(body["fields"]), {"leaseMonths", "startDate"})
+        status, body = self.new_agreement(tenantEmail="owner2@pfb.test")
+        self.assertEqual((status, list(body["fields"])), (400, ["tenantEmail"]))
+        self.assertEqual(owner.post(f"/api/properties/{self.property_id(self.SALE_LISTING)}/agreements", {})[0], 409)
+        self.assertEqual(self.client("owner2@pfb.test").post(
+            f"/api/properties/{self.property_id(self.RENT_LISTING)}/agreements", {})[0], 403)
+
+    def test_pb27_review_then_sign_and_no_signing_before_approval(self):
+        owner, tenant, advocate = self.client("owner@pfb.test"), self.client("tenant2@pfb.test"), self.client("advocate2@pfb.test")
+        _, draft = self.new_agreement()
+        url = f"/api/agreements/{draft['id']}"
+        self.assertEqual(tenant.post(f"{url}/sign", {"signature": "Sumaiya Islam"})[0], 409)
+        self.assertEqual(advocate.get(url)[0], 403)  # advocates see it only once it is sent for review
+        self.assertEqual(owner.post(f"{url}/submit")[1]["status"], "under_review")
+        self.assertEqual(owner.put(url, {"tenantEmail": "tenant@pfb.test", "startDate": draft["startDate"], "leaseMonths": 12})[0], 409)
+        self.assertEqual(owner.post(f"{url}/sign", {"signature": "Nadia Rahman"})[0], 409)
+        self.assertEqual(tenant.post(f"{url}/review", {"decision": "approved"})[0], 403)
+        self.assertIn(draft["id"], [a["id"] for a in advocate.get("/api/agreements")[1]["agreements"]])
+
+        # Changes requested: back to Draft with notes, then the landlord fixes and resends it.
+        self.assertEqual(advocate.post(f"{url}/review", {"decision": "changes_requested"})[0], 400)
+        status, body = advocate.post(f"{url}/review", {"decision": "changes_requested", "notes": "Add the notice period for the deposit."})
+        self.assertEqual((status, body["status"], body["reviewNotes"]), (200, "draft", "Add the notice period for the deposit."))
+        status, body = owner.put(url, {"tenantEmail": "tenant2@pfb.test", "startDate": draft["startDate"], "leaseMonths": 24,
+                                       "specialTerms": "Deposit returned within 30 days."})
+        self.assertEqual((status, body["leaseMonths"]), (200, 24), body)
+        owner.post(f"{url}/submit")
+        status, body = advocate.post(f"{url}/review", {"decision": "approved"})
+        self.assertEqual((status, body["status"], body["reviewer"]["name"]), (200, "approved", "Adv. Mahmud Karim"))
+
+        # Signing: the typed name must match, both sides sign, then it is Signed.
+        status, body = tenant.post(f"{url}/sign", {"signature": "Someone Else"})
+        self.assertEqual(status, 400)
+        self.assertIn("signature", body["fields"])
+        self.assertEqual(self.client("tenant@pfb.test").post(f"{url}/sign", {"signature": "Rafi Chowdhury"})[0], 403)
+        status, body = tenant.post(f"{url}/sign", {"signature": "  sumaiya   ISLAM "})
+        self.assertEqual((status, body["status"], bool(body["tenantSignedAt"])), (200, "approved", True))
+        self.assertEqual(tenant.post(f"{url}/sign", {"signature": "Sumaiya Islam"})[0], 409)
+        status, body = owner.post(f"{url}/sign", {"signature": "Nadia Rahman"})
+        self.assertEqual((status, body["status"]), (200, "signed"))
+        pdf = tenant.get(f"{url}/pdf")[1]
+        self.assertIn(b"Signed by both parties", pdf)
+        self.assertIn(b"Reviewed and approved by Adv. Mahmud Karim", pdf)
+        with self.db() as connection:
+            steps = [tuple(r) for r in connection.execute(
+                "SELECT old_value, new_value FROM audit_log WHERE target_type = 'rent_agreement' AND target_id = ? "
+                "AND action_type = 'agreement_status_changed' ORDER BY id", (draft["id"],))]
+        self.assertEqual(steps, [("draft", "under_review"), ("under_review", "draft"), ("draft", "under_review"),
+                                 ("under_review", "approved"), ("approved", "signed")])
+
+    def test_pb28_saved_search_alerts_when_a_matching_home_is_verified(self):
+        tenant, tenant2 = self.client("tenant@pfb.test"), self.client("tenant2@pfb.test")
+        status, body = tenant2.post("/api/saved-searches", {"filters": {"purpose": "rent", "area": "dhanmondi", "bedrooms": "2", "verified": "1"}})
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["filters"], {"purpose": "rent", "area": "dhanmondi", "bedrooms": "2"})
+        self.assertEqual(tenant2.post("/api/saved-searches", {"filters": {"purpose": "rent", "area": "dhanmondi", "bedrooms": "2"}})[1]["id"], body["id"])
+        nomatch = tenant2.post("/api/saved-searches", {"filters": {"purpose": "sale", "area": "Rangpur"}})[1]
+        self.assertEqual(tenant2.post("/api/saved-searches", {"filters": {"type": "Castle"}})[0], 400)
+        self.assertEqual(self.client("owner@pfb.test").post("/api/saved-searches", {"filters": {}})[0], 403)
+        tenant.post("/api/notifications/read", {"all": True})
+        tenant2.post("/api/notifications/read", {"all": True})
+
+        # The lake flat (rent, Dhanmondi, 2 bedrooms) is verified: both tenants' searches match it.
+        request_id = self.request_id(self.RENT_LISTING)
+        advocate = self.client("advocate@pfb.test")
+        advocate.post(f"/api/verification-requests/{request_id}/start-review")
+        advocate.post(f"/api/verification-requests/{request_id}/decision", {
+            "decision": "document_verified", "notes": "All papers are in order.",
+            "checklist": {"land_deed": "ok", "mutation": "ok", "tax_receipt": "ok", "ownership_history": "ok"}})
+        listing_id = self.property_id(self.RENT_LISTING)
+        for client in (tenant, tenant2):
+            alerts = [n for n in client.get("/api/notifications")[1]["notifications"] if n["kind"] == "saved_search"]
+            self.assertEqual(len(alerts), 1)  # one alert per person, even with two matching searches
+            self.assertEqual((alerts[0]["title"], alerts[0]["link"]), ("A new verified home matches your search", f"/property/{listing_id}"))
+        searches = {s["id"]: s for s in tenant2.get("/api/saved-searches")[1]["savedSearches"]}
+        self.assertGreaterEqual(searches[body["id"]]["verifiedMatches"], 1)
+        self.assertEqual(searches[nomatch["id"]]["verifiedMatches"], 0)
+        # Deleting works, and only for your own searches.
+        self.assertEqual(tenant.delete(f"/api/saved-searches/{body['id']}")[0], 404)
+        self.assertEqual(tenant2.delete(f"/api/saved-searches/{body['id']}")[0], 200)
+        self.assertNotIn(body["id"], [s["id"] for s in tenant2.get("/api/saved-searches")[1]["savedSearches"]])
+
+    def test_pb29_admin_report_counts_listings_and_advocate_work(self):
+        status, report = self.client("admin@pfb.test").get("/api/admin/report")
+        self.assertEqual(status, 200)
+        listings = report["listings"]
+        with self.db() as connection:
+            count = lambda sql: connection.execute(sql).fetchone()[0]  # noqa: E731
+            active = count("SELECT COUNT(*) FROM properties WHERE listing_status = 'active'")
+            verified = count("SELECT COUNT(*) FROM properties WHERE listing_status = 'active' AND verification_status = 'document_verified'")
+            rent = count("SELECT COUNT(*) FROM properties WHERE listing_status = 'active' AND listing_type = 'rent'")
+        self.assertEqual((listings["active"], listings["verified"], listings["unverified"]), (active, verified, active - verified))
+        self.assertEqual((listings["rent"], listings["sale"]), (rent, active - rent))
+        self.assertEqual(sum(v["verified"] + v["unverified"] for v in listings["byType"].values()), active)
+        self.assertEqual(sum(listings["badgeLevels"].values()), verified)
+        work = {a["name"]: a for a in report["advocates"]}
+        self.assertEqual(set(work), {"Adv. Sarah Rahman", "Adv. Mahmud Karim"})  # not the applicant who is not verified
+        self.assertEqual(work["Adv. Mahmud Karim"]["inReview"], 1)
+        self.assertGreater(report["verification"]["waitingForAdvocate"], 0)
+        self.assertEqual(report["agreementsToReview"], 1)
+        self.assertEqual(report["listingReports"]["open"], 3)
+        for email in ("owner@pfb.test", "advocate@pfb.test", "tenant@pfb.test"):
+            self.assertEqual(self.client(email).get("/api/admin/report")[0], 403)
+
+    def test_pb30_report_a_listing_and_admin_removes_or_dismisses(self):
+        tenant, owner, admin = self.client("tenant2@pfb.test"), self.client("owner@pfb.test"), self.client("admin@pfb.test")
+        listing_id = self.property_id(self.SALE_LISTING)
+        url = f"/api/properties/{listing_id}/reports"
+        self.assertEqual(tenant.post(url, {"reason": "other"})[0], 400)  # "other" needs details
+        self.assertEqual(tenant.post(url, {"reason": "nonsense"})[0], 400)
+        self.assertEqual(tenant.post(url, {"reason": "fake", "details": "Photos are copied from another website."})[0], 201)
+        self.assertEqual(tenant.post(url, {"reason": "fake"})[0], 409)  # one open report per person
+        self.assertEqual(owner.post(url, {"reason": "fake"})[0], 403)  # not your own listing
+        self.assertEqual(self.client().post(url, {"reason": "fake"})[0], 401)
+        self.assertEqual(self.client("tenant@pfb.test").post(url, {"reason": "duplicate"})[0], 201)
+
+        reports = admin.get("/api/admin/listing-reports")[1]["reports"]
+        mine = [r for r in reports if r["property"]["id"] == listing_id]
+        self.assertEqual((len(mine), mine[0]["openForListing"]), (2, 2))
+        self.assertEqual(self.client("advocate@pfb.test").get("/api/admin/listing-reports")[0], 403)
+        self.assertEqual(admin.post(f"/api/admin/listing-reports/{mine[0]['id']}/resolve", {"action": "remove"})[0], 400)
+        status, body = admin.post(f"/api/admin/listing-reports/{mine[0]['id']}/resolve", {"action": "remove", "note": "Photos are copied."})
+        self.assertEqual((status, body["status"], body["property"]["listingStatus"]), (200, "removed", "removed"))
+        # The listing leaves the search results, and both reports on it are closed.
+        titles = [p["title"] for p in self.client().get("/api/properties")[1]["properties"]]
+        self.assertNotIn(self.SALE_LISTING, titles)
+        self.assertEqual(self.client().get(f"/api/properties/{listing_id}")[0], 404)
+        self.assertEqual([r for r in admin.get("/api/admin/listing-reports")[1]["reports"] if r["property"]["id"] == listing_id], [])
+        self.assertEqual(admin.post(f"/api/admin/listing-reports/{mine[1]['id']}/resolve", {"action": "dismiss"})[0], 409)
+        self.assertEqual(owner.get("/api/notifications")[1]["notifications"][0]["title"], "Your listing was removed")
+
+        # Dismissing keeps the listing online.
+        other = next(r for r in admin.get("/api/admin/listing-reports")[1]["reports"] if r["property"]["title"] == "Old Dhaka family house in Wari")
+        status, body = admin.post(f"/api/admin/listing-reports/{other['id']}/resolve", {"action": "dismiss"})
+        self.assertEqual((status, body["status"], body["property"]["listingStatus"]), (200, "dismissed", "active"))
+
+    def test_pb31_pages_are_built_for_small_screens(self):
+        guest = self.client()
+        status, page = guest.get("/")
+        self.assertIn(b'name="viewport" content="width=device-width, initial-scale=1"', page)
+        css = guest.get("/css/app.css")[1]
+        self.assertIn(b"@media (max-width: 600px)", css)
+        script = guest.get("/js/ui.js")[1]
+        self.assertIn(b'loading="lazy"', script)   # photos load only when they scroll into view
+        self.assertIn(b"w=${width}", script)        # the photo size can be chosen per page
+        self.assertIn(b", 640)}", guest.get("/js/views/home.js")[1])  # cards ask for smaller photos than the listing page
+
+    def test_sprint4_demo_data_and_upgrade_from_an_older_database(self):
+        statuses = sorted(a["status"] for a in self.client("admin@pfb.test").get("/api/agreements")[1]["agreements"])
+        self.assertEqual(statuses, ["approved", "under_review"])
+        tenant_agreement = self.client("tenant@pfb.test").get("/api/agreements")[1]["agreements"][0]
+        self.assertEqual((tenant_agreement["status"], tenant_agreement["canSign"]), ("approved", True))
+        self.assertEqual(len(self.client("tenant@pfb.test").get("/api/saved-searches")[1]["savedSearches"]), 2)
+
+        old = Path(self.temp.name) / "old.sqlite3"
+        connection = sqlite3.connect(old)
+        connection.executescript(db.SCHEMA + db.HISTORY_SCHEMA + db.ADVOCATE_VERIFICATION_SCHEMA + db.SPRINT3_SCHEMA)
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+        connection.close()
+        self.assertFalse(db.initialize(old))
+        with contextlib.closing(sqlite3.connect(old)) as connection:
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(rent_agreements)")}
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        self.assertTrue({"saved_searches", "listing_reports"} <= tables)
+        self.assertTrue({"lease_months", "landlord_signed_at", "tenant_signed_at", "review_notes"} <= columns)
 
 
 class WsgiHostingTests(ApiTestCase):

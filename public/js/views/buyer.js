@@ -18,13 +18,31 @@ export function describeFilters(filters) {
   return parts.join(' · ') || 'All homes';
 }
 
-export async function renderHistory({ root, navigate }) {
-  const { views, searches } = await api.get('/api/history');
+export async function renderHistory({ root, navigate, session }) {
+  const isBuyer = session.user.role === 'buyer_tenant';
+  const [{ views, searches }, saved] = await Promise.all([
+    api.get('/api/history'), isBuyer ? api.get('/api/saved-searches') : Promise.resolve({ savedSearches: [] }),
+  ]);
+  const { savedSearches } = saved;
   mount(root, html`
     <div class="page-head"><div><h1>History</h1>
       <p>Homes you opened and searches you made while logged in. Only you and the site admin can see this.</p></div>
       ${views.length || searches.length ? html`<button class="btn btn-danger" type="button" id="clear-history">Clear my history</button>` : ''}
     </div>
+    ${isBuyer ? html`<section class="panel">
+      <div class="panel-title"><h2>Saved searches</h2><span class="muted small">alerts on</span></div>
+      <p class="muted small">You get a notification when a newly verified home matches one of these. Save a search from the Find homes page.</p>
+      ${savedSearches.length ? html`<div class="table-wrap"><table class="data">
+        <thead><tr><th>Search</th><th class="num">Verified homes now</th><th>Saved</th><th class="num"></th></tr></thead>
+        <tbody>${savedSearches.map(search => html`<tr>
+          <td>${describeFilters(search.filters)}</td>
+          <td class="num">${search.verifiedMatches}</td>
+          <td>${formatDate(search.createdAt)}</td>
+          <td><div class="actions">
+            <a class="btn btn-outline btn-small" href="#/?${new URLSearchParams({ ...search.filters, verified: '1' }).toString()}">Show homes</a>
+            <button class="btn btn-danger btn-small" type="button" data-delete-search="${search.id}">Delete</button></div></td>
+        </tr>`)}</tbody></table></div>` : html`<p class="muted">No saved searches yet.</p>`}
+    </section>` : ''}
     <section class="panel">
       <div class="panel-title"><h2>Recent searches</h2><span class="muted small">${searches.length} saved</span></div>
       ${searches.length ? html`<div class="table-wrap"><table class="data">
@@ -44,6 +62,20 @@ export async function renderHistory({ root, navigate }) {
       </div>`)}</div>` : html`<p class="muted">You have not opened any listings yet.</p>`}
     </section>
   `);
+
+  root.addEventListener('click', async event => {
+    const button = event.target.closest('[data-delete-search]');
+    if (!button || !confirmClick(button, 'Confirm')) return;
+    button.disabled = true;
+    try {
+      await api.del(`/api/saved-searches/${button.dataset.deleteSearch}`);
+      toast('Saved search deleted.');
+      navigate('/history');
+    } catch (error) {
+      toast(error.message, true);
+      button.disabled = false;
+    }
+  });
 
   const clear = $('#clear-history', root);
   clear?.addEventListener('click', async () => {

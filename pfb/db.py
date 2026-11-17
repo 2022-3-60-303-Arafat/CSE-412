@@ -8,7 +8,7 @@ now so later sprints only add features, not schema changes.
 import sqlite3
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 ROLES = ("buyer_tenant", "owner", "advocate", "admin")
 PROPERTY_TYPES = ("Apartment", "House", "Duplex", "Studio", "Plot", "Commercial")
@@ -271,8 +271,60 @@ ALTER TABLE advocate_profiles ADD COLUMN reviewed_by INTEGER REFERENCES users(id
 ALTER TABLE advocate_profiles ADD COLUMN reviewed_at TEXT;
 """
 
+# Version 4 (Sprint 3): in-app notifications (PB-25) and a consultation fee for every advocate (PB-22).
+SPRINT3_SCHEMA = """
+CREATE TABLE notifications (
+    id          INTEGER PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL DEFAULT '',
+    -- Page to open, as a path inside the site, for example '/consultations/4'.
+    link        TEXT,
+    is_read     INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX notifications_user ON notifications(user_id, is_read, id);
+UPDATE advocate_profiles SET consultation_fee = 500 WHERE consultation_fee = 0;
+"""
+
+# Version 5 (Sprint 4): rent agreement details (PB-26, PB-27), saved searches (PB-28), listing reports (PB-30).
+SPRINT4_SCHEMA = """
+ALTER TABLE rent_agreements ADD COLUMN lease_months INTEGER;
+ALTER TABLE rent_agreements ADD COLUMN utilities_included INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rent_agreements ADD COLUMN special_terms TEXT;
+ALTER TABLE rent_agreements ADD COLUMN review_notes TEXT;
+ALTER TABLE rent_agreements ADD COLUMN submitted_at TEXT;
+ALTER TABLE rent_agreements ADD COLUMN reviewed_at TEXT;
+ALTER TABLE rent_agreements ADD COLUMN landlord_signed_at TEXT;
+ALTER TABLE rent_agreements ADD COLUMN tenant_signed_at TEXT;
+CREATE INDEX rent_agreements_parties ON rent_agreements(landlord_id, tenant_id, status);
+
+CREATE TABLE saved_searches (
+    id          INTEGER PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    filters     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (user_id, filters)
+);
+
+CREATE TABLE listing_reports (
+    id           INTEGER PRIMARY KEY,
+    property_id  INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    reporter_id  INTEGER NOT NULL REFERENCES users(id),
+    reason       TEXT NOT NULL CHECK (reason IN ('fake', 'wrong_details', 'already_gone', 'duplicate', 'other')),
+    details      TEXT,
+    status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'dismissed', 'removed')),
+    admin_note   TEXT,
+    resolved_by  INTEGER REFERENCES users(id),
+    resolved_at  TEXT,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX listing_reports_status ON listing_reports(status, property_id);
+"""
+
 # Steps that bring an older database up to date, keyed by the version they start from.
-MIGRATIONS = {1: HISTORY_SCHEMA, 2: ADVOCATE_VERIFICATION_SCHEMA}
+MIGRATIONS = {1: HISTORY_SCHEMA, 2: ADVOCATE_VERIFICATION_SCHEMA, 3: SPRINT3_SCHEMA, 4: SPRINT4_SCHEMA}
 
 # Signed-in user rows carry advocate_status (NULL for every role except advocate).
 USER_SELECT = """SELECT u.*, ap.verification_status AS advocate_status
@@ -303,7 +355,7 @@ def initialize(path):
         if version == 0:
             # The default journal mode is used on purpose: WAL is not safe on the
             # network drives that hosting services such as PythonAnywhere use.
-            connection.executescript(SCHEMA + HISTORY_SCHEMA + ADVOCATE_VERIFICATION_SCHEMA)
+            connection.executescript(SCHEMA + HISTORY_SCHEMA + ADVOCATE_VERIFICATION_SCHEMA + SPRINT3_SCHEMA + SPRINT4_SCHEMA)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
             return True
@@ -329,3 +381,20 @@ def audit(connection, actor_id, action_type, target_type, target_id, old_value=N
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (actor_id, action_type, target_type, target_id, old_value, new_value, details, utc_now()),
     )
+
+
+def notify(connection, user_id, kind, title, body="", link=None):
+    """Add one in-app notification for a user (PB-25)."""
+    connection.execute(
+        "INSERT INTO notifications (user_id, kind, title, body, link, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, kind, title, body, link, utc_now()),
+    )
+
+
+def notify_advocates(connection, kind, title, body="", link=None):
+    """Notify every advocate who is active and verified."""
+    for (advocate_id,) in connection.execute(
+        """SELECT u.id FROM users u JOIN advocate_profiles ap ON ap.user_id = u.id
+           WHERE u.role = 'advocate' AND u.account_status = 'active' AND ap.verification_status = 'verified'"""
+    ).fetchall():
+        notify(connection, advocate_id, kind, title, body, link)

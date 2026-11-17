@@ -2,15 +2,17 @@
 
 import { api } from '../api.js';
 import {
-  $, ACTION_LABELS, ADVOCATE_STATUS, REQUEST_STATUS, ROLE_LABELS, badge, confirmClick, describeValue, formatDate, html, mount, submitting, toast,
+  $, ACTION_LABELS, ADVOCATE_STATUS, AGREEMENT_STATUS, REQUEST_STATUS, ROLE_LABELS, badge, taka, confirmClick, describeValue, formatDate, html, mount, submitting, toast,
 } from '../ui.js';
 import { describeFilters } from './buyer.js';
 
 const TABS = [
+  ['report', 'Platform report'],
   ['advocates', 'Advocates'],
   ['requests', 'Verification requests'],
   ['areas', 'High-demand areas'],
   ['activity', 'Browsing activity'],
+  ['reports', 'Listing reports'],
   ['audit', 'Audit log'],
 ];
 
@@ -330,10 +332,128 @@ async function activityTab(container, refresh, query) {
   $('#days-filter', container).addEventListener('change', event => refresh({ days: event.target.value }));
 }
 
-const RENDERERS = { advocates: advocatesTab, requests: requestsTab, areas: areasTab, activity: activityTab, audit: auditTab };
+// PB-29: one page with the numbers the admin watches.
+const share = (part, whole) => (whole ? Math.round((part / whole) * 100) : 0);
+
+async function reportTab(container, refresh) {
+  const report = await api.get('/api/admin/report');
+  const { listings, verification } = report;
+  const row = (label, kind) => html`<tr><th scope="row">${label}</th>
+    <td class="num">${listings.byType[kind].verified}</td>
+    <td class="num">${listings.byType[kind].unverified}${listings.byType[kind].issueFound ? html`<span class="sub">${listings.byType[kind].issueFound} with an issue</span>` : ''}</td>
+    <td class="num"><strong>${listings[kind]}</strong></td></tr>`;
+  mount(container, html`
+    <div class="panel">
+      <div class="panel-title"><h2>Platform report</h2><span class="muted small">As of ${formatDate(report.generatedAt, true)}</span></div>
+      <ul class="fact-list stat-tiles">
+        <li><small>Active listings</small><strong>${listings.active}</strong></li>
+        <li><small>Verified</small><strong>${listings.verified}</strong><span class="sub">${share(listings.verified, listings.active)}% of active</span></li>
+        <li><small>Unverified</small><strong>${listings.unverified}</strong><span class="sub">${listings.issueFound} with an issue found</span></li>
+        <li><small>For sale</small><strong>${listings.sale}</strong></li>
+        <li><small>For rent</small><strong>${listings.rent}</strong></li>
+        <li><small>Open listing reports</small><strong>${report.listingReports.open}</strong></li>
+      </ul>
+      <div class="share-bar" role="img" aria-label="${share(listings.verified, listings.active)}% of active listings are verified">
+        <span style="width: ${share(listings.verified, listings.active)}%"></span></div>
+      <p class="small muted">Share of active listings that are verified.</p>
+    </div>
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-title"><h3>Verified and unverified, by sale and rent</h3></div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th></th><th class="num">Verified</th><th class="num">Unverified</th><th class="num">Total</th></tr></thead>
+          <tbody>${row('For sale', 'sale')}${row('For rent', 'rent')}
+            <tr class="total"><th scope="row">All active</th><td class="num">${listings.verified}</td><td class="num">${listings.unverified}</td><td class="num"><strong>${listings.active}</strong></td></tr></tbody>
+        </table></div>
+        <p class="small muted">Verified listings by badge level: ${listings.badgeLevels.document_verified} Document Verified,
+          ${listings.badgeLevels.site_visited} Site Visited, ${listings.badgeLevels.fully_verified} Fully Verified.
+          Not counted above: ${listings.soldOrRented} sold or rented, ${listings.removed} removed.</p>
+      </div>
+      <div class="panel">
+        <div class="panel-title"><h3>Verification pipeline</h3></div>
+        <table class="data"><tbody>
+          <tr><td>Waiting for an advocate</td><td class="num"><strong>${verification.waitingForAdvocate}</strong></td></tr>
+          <tr><td>Waiting for the owner's papers</td><td class="num">${verification.waitingForPapers}</td></tr>
+          <tr><td>In review</td><td class="num">${verification.inReview}</td></tr>
+          <tr><td>Issue found, waiting for the owner</td><td class="num">${verification.issueFound}</td></tr>
+          <tr><td>Rent agreements to review</td><td class="num">${report.agreementsToReview}</td></tr>
+        </tbody></table>
+        ${verification.oldestWaitingSince ? html`<p class="small muted">Oldest request waiting since ${formatDate(verification.oldestWaitingSince)}.</p>` : ''}
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title"><h3>Advocates' pending work</h3><a class="btn btn-outline btn-small" href="#/admin?tab=advocates">Manage advocates</a></div>
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>Advocate</th><th class="num">Reviews in progress</th><th class="num">Consultation requests</th><th class="num">Sessions booked</th><th class="num">Decided so far</th></tr></thead>
+        <tbody>${report.advocates.map(advocate => html`<tr>
+          <td><strong>${advocate.name}</strong>${advocate.accountStatus === 'blocked' ? html` ${badge('blocked', 'Blocked')}` : ''}</td>
+          <td class="num">${advocate.inReview}</td><td class="num">${advocate.consultationRequests}</td>
+          <td class="num">${advocate.sessionsBooked}</td><td class="num">${advocate.decided}</td></tr>`)}</tbody></table></div>
+    </div>
+    <div class="grid-2">
+      <div class="panel"><div class="panel-title"><h3>Consultations</h3></div>
+        <table class="data"><tbody>
+          <tr><td>Free questions</td><td class="num">${report.consultations.freeQuestions}</td></tr>
+          <tr><td>Paid consultations</td><td class="num">${report.consultations.paidBookings}</td></tr>
+          <tr><td>Fees collected (demo)</td><td class="num">${taka(report.consultations.feesCollected)}</td></tr>
+        </tbody></table></div>
+      <div class="panel"><div class="panel-title"><h3>Rent agreements</h3></div>
+        <table class="data"><tbody>${Object.entries(report.agreements).map(([status, count]) => html`
+          <tr><td>${AGREEMENT_STATUS[status]}</td><td class="num">${count}</td></tr>`)}</tbody></table></div>
+    </div>`);
+}
+
+// PB-30: reports of fake or wrong listings. The admin dismisses them or removes the listing.
+async function listingReportsTab(container, refresh, query) {
+  const status = ['open', 'dismissed', 'removed'].includes(query.status) ? query.status : 'open';
+  const { reports } = await api.get(`/api/admin/listing-reports?status=${status}`);
+  mount(container, html`
+    <div class="panel">
+      <div class="panel-title"><h2>Listing reports</h2>
+        <label class="check">Show
+          <select id="report-filter">${[['open', 'Open'], ['dismissed', 'Dismissed'], ['removed', 'Listing removed']].map(([value, label]) => html`<option value="${value}" ${status === value ? html`selected` : ''}>${label}</option>`)}</select></label></div>
+      ${reports.length ? reports.map(report => html`
+        <div class="application">
+          <div class="application-head">
+            <div><strong><a href="#/property/${report.property.id}">${report.property.title}</a></strong>
+              <span class="sub">${report.property.areaName}, ${report.property.city} · owner ${report.property.ownerName}</span>
+              <span class="sub">Reported by ${report.reporter.name} (${ROLE_LABELS[report.reporter.role]}) on ${formatDate(report.createdAt, true)}
+                ${report.openForListing > 1 && report.status === 'open' ? ` · ${report.openForListing} open reports on this listing` : ''}</span></div>
+            ${badge(report.status === 'open' ? 'pending' : report.status === 'removed' ? 'blocked' : 'not_checked', report.status === 'open' ? 'Open' : report.status === 'removed' ? 'Listing removed' : 'Dismissed')}
+          </div>
+          <p><strong>${report.reasonLabel}.</strong> ${report.details || ''}</p>
+          ${report.adminNote ? html`<p class="small muted">Admin note: ${report.adminNote}${report.resolvedBy ? ` (${report.resolvedBy}, ${formatDate(report.resolvedAt)})` : ''}</p>` : ''}
+          ${report.status === 'open' ? html`<form class="resolve-form application-actions" data-report="${report.id}" novalidate>
+            <p class="form-error notice notice-error" hidden></p>
+            <label class="field"><span>Note <span class="hint">required to remove; the owner sees it</span></span><input name="note" maxlength="500"></label>
+            <div class="form-actions">
+              <button class="btn btn-danger btn-small" type="submit" value="remove">Remove the listing</button>
+              <button class="btn btn-outline btn-small" type="submit" value="dismiss">Dismiss report</button>
+            </div>
+          </form>` : ''}
+        </div>`) : html`<div class="empty"><h3>No ${status === 'open' ? 'open ' : ''}reports</h3><p>Reports that buyers, owners and advocates send about listings appear here.</p></div>`}
+    </div>`);
+  $('#report-filter', container).addEventListener('change', event => refresh({ status: event.target.value }));
+  container.addEventListener('submit', event => {
+    const form = event.target.closest('.resolve-form');
+    if (!form) return;
+    event.preventDefault();
+    const action = event.submitter?.value;
+    submitting(form, async () => {
+      await api.post(`/api/admin/listing-reports/${form.dataset.report}/resolve`, { action, note: form.note.value });
+      toast(action === 'remove' ? 'Listing removed. It no longer shows in search.' : 'Report dismissed.');
+      refresh();
+    });
+  });
+}
+
+const RENDERERS = {
+  report: reportTab, advocates: advocatesTab, requests: requestsTab, areas: areasTab, activity: activityTab,
+  reports: listingReportsTab, audit: auditTab,
+};
 
 export async function render({ root, query, navigate }) {
-  const tab = RENDERERS[query.tab] ? query.tab : 'advocates';
+  const tab = RENDERERS[query.tab] ? query.tab : 'report';
   mount(root, html`
     <div class="page-head"><div><h1>Admin panel</h1><p>Manage advocates, follow verification work and review the audit log.</p></div></div>
     <nav class="tabs" aria-label="Admin sections">
