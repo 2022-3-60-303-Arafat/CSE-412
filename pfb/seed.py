@@ -1,10 +1,11 @@
-"""Demo data so every Sprint 1 and Sprint 2 feature can be shown right after start-up."""
+"""Demo data so every Sprint 1 to 4 feature can be shown right after start-up."""
 
 import json
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
-from .db import audit
+from . import reports
+from .db import audit, notify
 from .security import hash_password
 
 DEMO_PASSWORD = "Demo@1234"
@@ -18,11 +19,16 @@ USERS = [
     ("tenant2", "Sumaiya Islam", "tenant2@pfb.test", "01710000008", "buyer_tenant"),
     ("advocate", "Adv. Sarah Rahman", "advocate@pfb.test", "01710000005", "advocate"),
     ("advocate2", "Adv. Mahmud Karim", "advocate2@pfb.test", "01710000006", "advocate"),
+    ("applicant", "Adv. Imran Hossain", "applicant@pfb.test", "01710000009", "advocate"),
 ]
 
 ADVOCATES = {
     "advocate": ("DBC-2016-0412", "Land and property documents"),
     "advocate2": ("DBC-2018-1187", "Rental agreements and title review"),
+}
+# Applied through the advocate sign-up page; waiting for the admin to send an appointment.
+ADVOCATE_APPLICANTS = {
+    "applicant": ("DBC-2022-0731", "Property transfer and registration"),
 }
 
 # key, owner, listing type, title, area, city, address, type, amount, beds, baths, sqft, furnished, photo, description, rent extras
@@ -121,6 +127,9 @@ ISSUE_FOUND = {
 # Already picked up by the second advocate, so the queue shows a review in progress.
 IN_REVIEW = {"bashundhara-rent": "advocate2"}
 HIGH_DEMAND_AREAS = ["Gulshan", "Banani"]
+# Sprint 3: verified listings where the advocate did more than check the papers (PB-19).
+BADGE_LEVELS = {"banani": "fully_verified", "uttara": "site_visited"}
+CONSULTATION_FEES = {"advocate": 500, "advocate2": 700}
 
 
 def sample_pdf(lines):
@@ -155,12 +164,12 @@ def seed(connection, upload_dir):
     def at(days_ago, hours=0):
         return (now - timedelta(days=days_ago, hours=hours)).isoformat(timespec="seconds")
 
-    password_hash = hash_password(DEMO_PASSWORD)
     users = {}
     for key, name, email, phone, role in USERS:
         cursor = connection.execute(
             "INSERT INTO users (full_name, email, phone, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (name, email, phone, password_hash, role, at(30)),
+            # Hashed separately for each account, so every account gets its own salt.
+            (name, email, phone, hash_password(DEMO_PASSWORD), role, at(30)),
         )
         users[key] = cursor.lastrowid
     for key, (bar_id, specialization) in ADVOCATES.items():
@@ -169,6 +178,13 @@ def seed(connection, upload_dir):
             (users[key], bar_id, specialization, users["admin"], at(29)),
         )
         audit(connection, users["admin"], "advocate_added", "user", users[key], None, "active", "Demo data")
+    for key, (bar_id, specialization) in ADVOCATE_APPLICANTS.items():
+        connection.execute(
+            """INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_at, verification_status)
+               VALUES (?, ?, ?, ?, 'pending')""",
+            (users[key], bar_id, specialization, at(2)),
+        )
+        audit(connection, users[key], "advocate_applied", "user", users[key], None, "pending", "Demo data")
 
     properties = {}
     for index, (key, owner, kind, title, area, city, address, ptype, amount, beds, baths, sqft, furnished, photo, desc, rent) in enumerate(LISTINGS):
@@ -291,6 +307,8 @@ def seed(connection, upload_dir):
             "INSERT INTO favorites (user_id, property_id, saved_at) VALUES (?, ?, ?)", (users[sender], properties[key][0], at(2))
         )
     seed_browsing(connection, users, properties, at)
+    seed_sprint3(connection, users, properties, at, now)
+    seed_sprint4(connection, users, properties, at, now)
 
 
 # Searches the demo tenants made (before the demo starts), for the History page.
@@ -350,3 +368,144 @@ def seed_browsing(connection, users, properties, at):
             "INSERT INTO search_history (user_id, filters, result_count, searched_at) VALUES (?, ?, ?, ?)",
             (users[who], json.dumps(filters, sort_keys=True), count_matches(filters), at(days_ago, hours=4)),
         )
+
+
+def seed_sprint3(connection, users, properties, at, now):
+    """Legal reports, badge levels, consultations, payments and notifications (PB-18 to PB-25)."""
+    connection.execute("UPDATE advocate_profiles SET consultation_fee = 500 WHERE consultation_fee = 0")
+    for key, fee in CONSULTATION_FEES.items():
+        connection.execute("UPDATE advocate_profiles SET consultation_fee = ? WHERE user_id = ?", (fee, users[key]))
+    for key, level in BADGE_LEVELS.items():
+        connection.execute("UPDATE properties SET badge_level = ? WHERE id = ?", (level, properties[key][0]))
+    for (request_id,) in connection.execute("SELECT id FROM verification_requests WHERE status = 'document_verified'").fetchall():
+        reports.ensure_report(connection, request_id)
+
+    def slot(days_ahead, hour):
+        """A slot on a working day (not Friday), in Bangladesh time."""
+        day = (now + timedelta(hours=6)).date() + timedelta(days=days_ahead)
+        if day.weekday() == 4:
+            day += timedelta(days=1)
+        return f"{day.isoformat()}T{hour:02d}:00"
+
+    def consultation(client, advocate, key, kind, status, slot_start=None, notes=None, days_ago=2):
+        fee = 0 if kind == "free_chat" else CONSULTATION_FEES[advocate]
+        return connection.execute(
+            """INSERT INTO consultations (property_id, client_id, advocate_id, kind, slot_start, fee, status, follow_up_notes, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (properties[key][0], users[client], users[advocate], kind, slot_start, fee, status, notes, at(days_ago)),
+        ).lastrowid
+
+    def paid(consultation_id, advocate, method, reference, days_ago):
+        connection.execute(
+            """INSERT INTO payments (consultation_id, amount, method, status, transaction_ref, created_at, paid_at)
+               VALUES (?, ?, ?, 'paid', ?, ?, ?)""",
+            (consultation_id, CONSULTATION_FEES[advocate], method, reference, at(days_ago), at(days_ago)),
+        )
+
+    # A free question with an answer (PB-21).
+    chat = consultation("tenant", "advocate", "banani", "free_chat", "confirmed")
+    for sender, body, hours in (
+        ("tenant", "Hello, is there any bank loan or mortgage on this flat that I should know about?", 30),
+        ("advocate", "Hello. The deed and the mutation record show no mortgage or charge on this flat. "
+                     "Ask the owner for a recent non-encumbrance certificate before you pay the booking money.", 26),
+    ):
+        connection.execute(
+            "INSERT INTO chat_messages (consultation_id, sender_id, body, sent_at) VALUES (?, ?, ?, ?)",
+            (chat, users[sender], body, at(0, hours=hours)),
+        )
+    # Paid consultations in every state (PB-22 to PB-24).
+    booked = consultation("tenant", "advocate", "uttara", "paid", "confirmed", slot(1, 10))
+    paid(booked, "advocate", "bkash", "PFB-DEMO000001", 1)
+    waiting_payment = consultation("tenant", "advocate2", "dhanmondi-studio", "paid", "confirmed", slot(2, 16), days_ago=1)
+    waiting_advocate = consultation("tenant2", "advocate", "banani", "paid", "requested", slot(1, 11), days_ago=0)
+    done = consultation(
+        "tenant2", "advocate2", "panchlaish", "paid", "completed", (now - timedelta(days=3)).strftime("%Y-%m-%dT15:00"),
+        notes="We went through the deed and the mutation paper together. Before you sign: 1) see the original deed, "
+              "2) collect the latest tax receipt, 3) register the sale deed at the sub-registry office and keep the receipt.",
+        days_ago=6,
+    )
+    paid(done, "advocate2", "nagad", "PFB-DEMO000002", 5)
+
+    # Unread notifications, so the bell shows a count for each demo account (PB-25).
+    verified_request = connection.execute(
+        "SELECT id FROM verification_requests WHERE property_id = ? ORDER BY id DESC LIMIT 1", (properties["banani"][0],)
+    ).fetchone()[0]
+    pending_request = connection.execute(
+        "SELECT id FROM verification_requests WHERE property_id = ? ORDER BY id DESC LIMIT 1", (properties["gulshan"][0],)
+    ).fetchone()[0]
+    notify(connection, users[properties["banani"][1]], "verification_result", "Your property is Document Verified",
+           f"{properties['banani'][2]} now shows the Verified badge. Buyers can download its legal report.",
+           f"/owner/verification/{verified_request}")
+    notify(connection, users["advocate"], "verification_request", "New verification request",
+           f"{properties['gulshan'][2]} is waiting in the queue.", f"/advocate/requests/{pending_request}")
+    notify(connection, users["advocate"], "consultation", "New consultation request",
+           "Sumaiya Islam asked for a paid consultation.", f"/consultations/{waiting_advocate}")
+    notify(connection, users["tenant"], "chat_message", "Adv. Sarah Rahman replied to your question",
+           "The deed and the mutation record show no mortgage or charge on this flat.", f"/consultations/{chat}")
+    notify(connection, users["tenant"], "consultation", "Your consultation was accepted",
+           "Adv. Mahmud Karim accepted your slot. Pay the fee of 700 taka to confirm the booking.",
+           f"/consultations/{waiting_payment}")
+    notify(connection, users["tenant2"], "consultation", "Follow-up notes from your advocate",
+           "Adv. Mahmud Karim added notes after your consultation.", f"/consultations/{done}")
+
+
+def seed_sprint4(connection, users, properties, at, now):
+    """Rent agreements, saved searches and listing reports (PB-26 to PB-30)."""
+    from .sprint4 import add_months
+
+    today = (now + timedelta(hours=6)).date()
+
+    def agreement(key, tenant, status, start_in_days, months, reviewer=None, landlord_signed=False, special=None):
+        property_id, owner_key, title = properties[key]
+        rent = connection.execute("SELECT * FROM rent_details WHERE property_id = ?", (property_id,)).fetchone()
+        start = today + timedelta(days=start_in_days)
+        submitted = at(2) if status != "draft" else None
+        reviewed = at(1) if status in ("approved", "signed") else None
+        agreement_id = connection.execute(
+            """INSERT INTO rent_agreements (property_id, landlord_id, tenant_id, reviewer_id, start_date, end_date, lease_months,
+                   monthly_rent, security_deposit, utilities_included, special_terms, status, submitted_at, reviewed_at,
+                   landlord_signed_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (property_id, users[owner_key], users[tenant], users[reviewer] if reviewer else None, start.isoformat(),
+             add_months(start, months).isoformat(), months, rent["monthly_rent"], rent["security_deposit"],
+             rent["utilities_included"], special, status, submitted, reviewed, at(0, hours=20) if landlord_signed else None, at(3)),
+        ).lastrowid
+        audit(connection, users[owner_key], "agreement_created", "rent_agreement", agreement_id, None, "draft", title)
+        if status != "draft":
+            audit(connection, users[owner_key], "agreement_status_changed", "rent_agreement", agreement_id, "draft", "under_review", title)
+        if reviewer:
+            audit(connection, users[reviewer], "agreement_status_changed", "rent_agreement", agreement_id, "under_review", status, None)
+        return agreement_id
+
+    # Approved and signed by the landlord: the tenant can sign it in the demo.
+    approved = agreement("dhanmondi-studio", "tenant", "approved", 14, 12, reviewer="advocate", landlord_signed=True,
+                         special="The tenant may keep one small pet.")
+    # Waiting for an advocate to review it.
+    waiting = agreement("banani", "tenant2", "under_review", 20, 24)
+    notify(connection, users["tenant"], "agreement", "Please sign the rent agreement",
+           f"Nadia Rahman signed the agreement for {properties['dhanmondi-studio'][2]}.", f"/agreements/{approved}")
+    notify(connection, users["advocate"], "agreement", "A rent agreement needs review",
+           f"{properties['banani'][2]}: Tanvir Hasan and Sumaiya Islam.", f"/agreements/{waiting}")
+
+    # Saved searches (PB-28). Verifying "Easy, airy living by the lake" (the Sprint 2 demo) alerts the first tenant.
+    for who, filters, days_ago in (
+        ("tenant", {"purpose": "rent", "area": "Dhanmondi"}, 4),
+        ("tenant", {"purpose": "rent", "bedrooms": "2", "maxPrice": "40000"}, 3),
+        ("tenant2", {"purpose": "sale", "area": "Gulshan"}, 5),
+    ):
+        connection.execute("INSERT INTO saved_searches (user_id, filters, created_at) VALUES (?, ?, ?)",
+                           (users[who], json.dumps(filters, sort_keys=True), at(days_ago)))
+
+    # Reports of suspicious listings waiting for the admin (PB-30).
+    for who, key, reason, details, days_ago in (
+        ("tenant2", "purbachal-plot", "fake", "The plot number is not in the RAJUK allotment list I checked.", 1),
+        ("tenant", "purbachal-plot", "wrong_details", "The price is far below every other plot in Sector 4.", 2),
+        ("tenant", "wari-house", "already_gone", "The neighbours say this house was sold last month.", 3),
+    ):
+        report_id = connection.execute(
+            "INSERT INTO listing_reports (property_id, reporter_id, reason, details, created_at) VALUES (?, ?, ?, ?, ?)",
+            (properties[key][0], users[who], reason, details, at(days_ago)),
+        ).lastrowid
+        audit(connection, users[who], "listing_reported", "property", properties[key][0], None, reason, details)
+    notify(connection, users["admin"], "listing_report", "A listing was reported",
+           f"{properties['purbachal-plot'][2]}: The listing looks fake.", "/admin?tab=reports")

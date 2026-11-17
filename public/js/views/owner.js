@@ -40,6 +40,7 @@ function listingActions(property) {
   return html`<div class="actions">
     ${canRequest ? html`<button class="btn btn-accent btn-small" type="button" data-request="${property.id}">Request legal verification</button>` : ''}
     ${request && request.status !== 'document_verified' ? html`<a class="btn btn-${request.status === 'issue_found' ? 'warn' : 'outline'} btn-small" href="#/owner/verification/${request.id}">${request.status === 'issue_found' ? 'Fix issue' : 'Papers'}</a>` : ''}
+    ${property.listingType === 'rent' && property.listingStatus === 'active' ? html`<a class="btn btn-outline btn-small" href="#/agreements/new?property=${property.id}">Rent agreement</a>` : ''}
     <a class="btn btn-outline btn-small" href="#/property/${property.id}">View</a>
     <a class="btn btn-outline btn-small" href="#/owner/listings/${property.id}/edit">Edit</a>
     <button class="btn btn-danger btn-small" type="button" data-delete="${property.id}">Delete</button>

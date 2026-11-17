@@ -88,18 +88,23 @@ class Request:
             token = self.cookie(SESSION_COOKIE)
             if token:
                 self._user = self.connection.execute(
-                    """SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+                    db.USER_SELECT + """ JOIN sessions s ON s.user_id = u.id
                        WHERE s.token_hash = ? AND s.expires_at > ? AND u.account_status = 'active'""",
                     (token_digest(token), db.utc_now()),
                 ).fetchone()
         return self._user
 
     def require(self, *roles):
-        """Return the signed-in user, or stop with 401/403 if the role is not allowed."""
+        """Return the signed-in user, or stop with 401/403 if the role is not allowed.
+
+        An advocate who has not been verified in person yet cannot use advocate features.
+        """
         if self.user is None:
             raise ApiError(401, "Please log in to continue.")
         if roles and self.user["role"] not in roles:
             raise ApiError(403, "Your account role cannot use this feature.")
+        if roles and self.user["role"] == "advocate" and self.user["advocate_status"] != "verified":
+            raise ApiError(403, "Your advocate account is not verified yet.")
         return self.user
 
     def set_cookie(self, value, max_age):

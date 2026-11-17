@@ -2,7 +2,7 @@
 // Admins open the same request page read-only.
 
 import { api } from '../api.js';
-import { $, REQUEST_STATUS, REVIEW_STATUS, badge, formatDate, html, mount, submitting, toast } from '../ui.js';
+import { $, BADGE_LEVELS, BADGE_MEANING, REQUEST_STATUS, REVIEW_STATUS, badge, formatDate, html, mount, submitting, toast } from '../ui.js';
 import { documentFile, historyList, steps } from './owner.js';
 
 const CHECKLIST = [
@@ -94,7 +94,32 @@ function resultPanel(request) {
     <div class="notes-box ${ok ? 'ok' : ''}">${request.advocateNotes}</div>
     ${request.checklist ? html`<table class="checklist"><tbody>${CHECKLIST.map(([key, label]) => html`<tr>
       <td>${label}</td><td>${badge(request.checklist[key], REVIEW_STATUS[request.checklist[key]])}</td></tr>`)}</tbody></table>` : ''}
-  </div>`;
+  </div>
+  ${levelPanel(request)}`;
+}
+
+// PB-19: after verifying, the advocate records how much checking was done. Everyone else just sees the level.
+function levelPanel(request) {
+  if (!request.badgeLevel) return '';
+  if (!request.canSetBadgeLevel) {
+    return html`<div class="panel"><h2>Badge level: ${BADGE_LEVELS[request.badgeLevel]}</h2>
+      <p class="muted">${BADGE_MEANING[request.badgeLevel]}</p>
+      <a class="btn btn-outline" href="/api/properties/${request.property.id}/legal-report" target="_blank" rel="noopener">Open the legal report (PDF)</a></div>`;
+  }
+  return html`<form class="panel" id="level-form" novalidate>
+    <h2>Badge level</h2>
+    <p class="muted small">Raise the level when you have done more than check the papers. The listing and the legal report show it.</p>
+    <p class="form-error notice notice-error" hidden></p>
+    <div class="level-choice">
+      ${Object.entries(BADGE_LEVELS).map(([value, label]) => html`
+        <label><input type="radio" name="level" value="${value}" ${request.badgeLevel === value ? html`checked` : ''}>
+          <span><strong>${label}</strong><small>${BADGE_MEANING[value]}</small></span></label>`)}
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">Save badge level</button>
+      <a class="btn btn-outline" href="/api/properties/${request.property.id}/legal-report" target="_blank" rel="noopener">Open the legal report (PDF)</a>
+    </div>
+  </form>`;
 }
 
 export async function renderRequest({ root, params, session, navigate }) {
@@ -161,6 +186,16 @@ export async function renderRequest({ root, params, session, navigate }) {
       toast(error.message, true);
       startButton.disabled = false;
     }
+  });
+
+  const levelForm = $('#level-form', root);
+  levelForm?.addEventListener('submit', event => {
+    event.preventDefault();
+    submitting(levelForm, async () => {
+      const result = await api.post(`/api/verification-requests/${request.id}/badge-level`, { level: levelForm.level.value });
+      toast(`Badge level saved: ${BADGE_LEVELS[result.badgeLevel]}.`);
+      navigate(`/advocate/requests/${request.id}`);
+    });
   });
 
   const form = $('#decision-form', root);

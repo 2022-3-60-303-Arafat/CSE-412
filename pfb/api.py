@@ -1,5 +1,8 @@
 """JSON API for Sprint 1 (roles, rent support, search) and Sprint 2 (legal verification).
 
+Sprint 3 (consultations, chat, payments, notifications) is in consult.py and Sprint 4 (rent agreements,
+saved searches, reports) is in sprint4.py. Both use the same router.
+
 Each handler checks the caller's role on the server, so hiding a menu item in
 the browser is never the only protection (PB-02, PB-03).
 """
@@ -10,8 +13,11 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from . import db
-from .db import CHECKLIST_ITEMS, DOCUMENT_TYPES, OPEN_REQUEST_STATUSES, PROPERTY_TYPES, REQUIRED_DOCUMENT_TYPES, audit, utc_now
+from . import db, reports
+from .db import (
+    CHECKLIST_ITEMS, DOCUMENT_TYPES, OPEN_REQUEST_STATUSES, PROPERTY_TYPES, REQUIRED_DOCUMENT_TYPES, USER_SELECT, audit, notify, notify_advocates,
+    utc_now,
+)
 from .security import (
     DUMMY_PASSWORD_HASH,
     SESSION_DAYS,
@@ -60,7 +66,8 @@ LEFT JOIN rent_details rd ON rd.property_id = p.id
 # ---------------------------------------------------------------- serializers
 
 def user_json(row):
-    return {
+    """Expects a row from USER_SELECT (or one that also has advocate_status)."""
+    data = {
         "id": row["id"],
         "fullName": row["full_name"],
         "email": row["email"],
@@ -69,14 +76,23 @@ def user_json(row):
         "accountStatus": row["account_status"],
         "createdAt": row["created_at"],
     }
+    if row["role"] == "advocate":
+        data["advocateStatus"] = row["advocate_status"]
+    return data
+
+
+def is_staff(user):
+    """Admins and verified advocates can see listings and requests that are hidden from the public."""
+    return user is not None and (
+        user["role"] == "admin" or (user["role"] == "advocate" and user["advocate_status"] == "verified")
+    )
 
 
 def property_json(row, viewer=None):
     is_owner = viewer is not None and viewer["id"] == row["owner_id"]
-    is_staff = viewer is not None and viewer["role"] in ("admin", "advocate")
     status = row["verification_status"]
     # The public only needs to know whether a listing is verified; issue details stay private.
-    if status == "issue_found" and not (is_owner or is_staff):
+    if status == "issue_found" and not (is_owner or is_staff(viewer)):
         status = "unverified"
     data = {
         "id": row["id"],
@@ -179,6 +195,10 @@ def start_session(request, user_id):
     request.set_cookie(token, SESSION_DAYS * 24 * 3600)
 
 
+def load_user(connection, user_id):
+    return connection.execute(USER_SELECT + " WHERE u.id = ?", (user_id,)).fetchone()
+
+
 def int_param(request, name, label, minimum, maximum):
     checker = Checker(request.query)
     value = checker.integer(name, label, minimum, maximum, required=False)
@@ -218,7 +238,7 @@ def signup(request):
     check_email(checker)
     check_phone(checker)
     check_new_password(checker)
-    # Advocates are added by an admin (PB-04) and admins are created by the system.
+    # Advocates apply through /api/auth/advocate-signup and admins are created by the system.
     checker.choice("role", "Account type", ("buyer_tenant", "owner"))
     data = checker.done()
 
@@ -232,8 +252,56 @@ def signup(request):
     )
     audit(connection, cursor.lastrowid, "account_created", "user", cursor.lastrowid, None, data["role"])
     start_session(request, cursor.lastrowid)
-    user = connection.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
-    return Response(201, {"user": user_json(user)})
+    return Response(201, {"user": user_json(load_user(connection, cursor.lastrowid))})
+
+
+def check_advocate_fields(checker):
+    checker.text("fullName", "Full name", min_length=2, max_length=80)
+    check_email(checker)
+    check_phone(checker)
+    check_new_password(checker)
+    checker.text("barCouncilId", "Bar Council ID", min_length=3, max_length=40)
+    checker.text("specialization", "Specialization", min_length=2, max_length=80)
+    return checker.done()
+
+
+DEFAULT_CONSULTATION_FEE = 500  # taka, for one paid consultation (PB-22)
+
+
+def create_advocate(connection, data, verification_status, added_by=None):
+    """Create an advocate account with its profile. Returns the new user id."""
+    conflicts = {}
+    if connection.execute("SELECT 1 FROM users WHERE email = ?", (data["email"],)).fetchone():
+        conflicts["email"] = "An account with this email already exists."
+    if connection.execute("SELECT 1 FROM advocate_profiles WHERE bar_council_id = ?", (data["barCouncilId"],)).fetchone():
+        conflicts["barCouncilId"] = "This Bar Council ID is already registered."
+    if conflicts:
+        raise ApiError(409, "Please fix the highlighted fields.", conflicts)
+    now = utc_now()
+    cursor = connection.execute(
+        """INSERT INTO users (full_name, email, phone, password_hash, role, created_at)
+           VALUES (?, ?, ?, ?, 'advocate', ?)""",
+        (data["fullName"], data["email"], data["phone"], hash_password(data["password"]), now),
+    )
+    connection.execute(
+        """INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_by, added_at, verification_status,
+                                          consultation_fee)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (cursor.lastrowid, data["barCouncilId"], data["specialization"], added_by, now, verification_status,
+         DEFAULT_CONSULTATION_FEE),
+    )
+    return cursor.lastrowid
+
+
+@router.route("POST", "/api/auth/advocate-signup")
+def advocate_signup(request):
+    """An advocate applies for an account. It stays unverified until the admin has met them in person."""
+    data = check_advocate_fields(Checker(request.json()))
+    connection = request.connection
+    user_id = create_advocate(connection, data, "pending")
+    audit(connection, user_id, "advocate_applied", "user", user_id, None, "pending", data["fullName"])
+    start_session(request, user_id)
+    return Response(201, {"user": user_json(load_user(connection, user_id))})
 
 
 @router.route("POST", "/api/auth/login")
@@ -250,7 +318,7 @@ def login(request):
         raise ApiError(429, "Too many failed attempts. Please wait 10 minutes and try again.")
 
     user = request.connection.execute(
-        "SELECT * FROM users WHERE email = ? AND account_status != 'removed'", (email,)
+        USER_SELECT + " WHERE u.email = ? AND u.account_status != 'removed'", (email,)
     ).fetchone()
     if user is None:
         verify_password(password, DUMMY_PASSWORD_HASH)
@@ -500,7 +568,7 @@ def get_property(request):
     viewer = request.user
     visible = row is not None and (
         row["listing_status"] == "active"
-        or (viewer is not None and (viewer["id"] == row["owner_id"] or viewer["role"] in ("admin", "advocate")) and row["listing_status"] != "removed")
+        or (viewer is not None and (viewer["id"] == row["owner_id"] or is_staff(viewer)) and row["listing_status"] != "removed")
     )
     if not visible:
         raise ApiError(404, "This listing does not exist or has been removed.")
@@ -781,6 +849,7 @@ def reply_inquiry(request):
 
 REQUEST_SELECT = f"""
 SELECT vr.*, p.title, p.area_name, p.city, p.address, p.listing_type, p.property_type, p.listing_status,
+       p.badge_level, p.verification_status AS property_verification,
        o.full_name AS owner_name, a.full_name AS advocate_name,
        {HIGH_DEMAND_SQL} AS is_high_demand,
        (SELECT COUNT(DISTINCT d.document_type) FROM legal_documents d
@@ -828,7 +897,7 @@ def can_view_request(user, row):
         return True
     if user["role"] == "owner":
         return row["owner_id"] == user["id"]
-    if user["role"] == "advocate":
+    if user["role"] == "advocate" and is_staff(user):
         return row["advocate_id"] == user["id"] or (row["status"] == "pending" and row["advocate_id"] is None)
     return False
 
@@ -838,7 +907,7 @@ def can_open_files(user, row):
     return (
         user["role"] == "admin"
         or (user["role"] == "owner" and row["owner_id"] == user["id"])
-        or (user["role"] == "advocate" and row["advocate_id"] == user["id"])
+        or (user["role"] == "advocate" and is_staff(user) and row["advocate_id"] == user["id"])
     )
 
 
@@ -849,6 +918,10 @@ def request_detail_json(connection, row, user):
     )
     data["advocateNotes"] = row["advocate_notes"]
     data["checklist"] = json.loads(row["checklist"]) if row["checklist"] else None
+    # PB-19: the advocate who verified the listing can raise its badge level.
+    is_current = row["status"] == "document_verified" and row["property_verification"] == "document_verified"
+    data["badgeLevel"] = row["badge_level"] if is_current else None
+    data["canSetBadgeLevel"] = is_current and user["role"] == "advocate" and row["advocate_id"] == user["id"]
     documents = connection.execute(
         "SELECT * FROM legal_documents WHERE request_id = ? ORDER BY uploaded_at DESC, id DESC", (row["id"],)
     ).fetchall()
@@ -883,6 +956,9 @@ def create_verification_request(connection, user, property_row):
     )
     audit(connection, user["id"], "verification_requested", "verification_request", cursor.lastrowid, None, "pending",
           f"Property #{property_row['id']}: {property_row['title']}")
+    notify_advocates(connection, "verification_request", "New verification request",
+                     f"{property_row['title']} in {property_row['area_name']} is waiting in the queue.",
+                     f"/advocate/requests/{cursor.lastrowid}")
     return cursor.lastrowid
 
 
@@ -1003,6 +1079,16 @@ def download_document(request):
     )
 
 
+@router.route("GET", "/api/advocate/application")
+def advocate_application(request):
+    """The advocate's own verification status, with the admin's appointment message."""
+    user = request.require()
+    if user["role"] != "advocate":
+        raise ApiError(403, "Your account role cannot use this feature.")
+    row = load_advocate(request.connection, user["id"])
+    return {"application": advocate_json(row), "user": user_json(row)}
+
+
 @router.route("GET", "/api/advocate/queue")
 def advocate_queue(request):
     user = request.require("advocate")
@@ -1086,7 +1172,56 @@ def decide_request(request):
     audit(connection, user["id"], "verification_status_changed", "verification_request", row["id"], "in_review", decision,
           cleaned["notes"])
     set_property_verification(connection, user["id"], row["property_id"], decision, f"Decision on request #{row['id']}")
+    if decision == "document_verified":
+        reports.ensure_report(connection, row["id"])  # PB-18: the legal report is created with the decision
+        sprint4.alert_saved_searches(connection, row["property_id"])  # PB-28: tell buyers whose saved search matches
+        notify(connection, row["owner_id"], "verification_result", "Your property is Document Verified",
+               f"{row['title']} now shows the Verified badge. Buyers can download its legal report.",
+               f"/owner/verification/{row['id']}")
+    else:
+        notify(connection, row["owner_id"], "verification_result", "An issue was found in your papers",
+               f"{row['title']}: read the advocate's notes and upload a corrected paper.",
+               f"/owner/verification/{row['id']}")
     return request_detail_json(connection, load_request(connection, row["id"]), user)
+
+
+@router.route("POST", "/api/verification-requests/{id}/badge-level")
+def set_badge_level(request):
+    """PB-19: the advocate who verified a listing sets how much checking was done."""
+    user = request.require("advocate")
+    connection = request.connection
+    row = load_request(connection, request.params["id"])
+    if row["advocate_id"] != user["id"]:
+        raise ApiError(403, "Only the advocate who verified this listing can change its badge level.")
+    if row["status"] != "document_verified" or row["property_verification"] != "document_verified":
+        raise ApiError(409, "A badge level can only be set on a verified listing.")
+    checker = Checker(request.json())
+    level = checker.choice("level", "Badge level", reports.BADGE_LEVELS)
+    checker.done()
+    if level != row["badge_level"]:
+        connection.execute("UPDATE properties SET badge_level = ?, updated_at = ? WHERE id = ?", (level, utc_now(), row["property_id"]))
+        reports.set_report_level(connection, row["id"], level)
+        audit(connection, user["id"], "badge_level_changed", "property", row["property_id"], row["badge_level"], level,
+              f"Set on request #{row['id']}")
+        notify(connection, row["owner_id"], "verification_result", f"Badge level: {reports.BADGE_LABELS[level]}",
+               f"{row['title']} now shows the {reports.BADGE_LABELS[level]} badge.", f"/property/{row['property_id']}")
+    return request_detail_json(connection, load_request(connection, row["id"]), user)
+
+
+@router.route("GET", "/api/properties/{id}/legal-report")
+def download_legal_report(request):
+    """PB-18: anyone looking at a verified listing can download its plain-language report."""
+    row = fetch_property(request.connection, request.params["id"])
+    report = None
+    if row is not None and row["listing_status"] == "active" and row["verification_status"] == "document_verified":
+        report = reports.current_report(request.connection, row["id"])
+    if report is None:
+        raise ApiError(404, "This listing has no legal report. Reports are made when an advocate verifies a property.")
+    return Response(
+        body=reports.report_pdf(report),
+        content_type="application/pdf",
+        headers=[("Content-Disposition", f'inline; filename="PFB-legal-report-{row["id"]}.pdf"')],
+    )
 
 
 # ---------------------------------------------------------------- admin (PB-04, PB-16, PB-17)
@@ -1099,13 +1234,17 @@ def advocate_json(row):
             "specialization": row["specialization"],
             "activeCases": row["active_cases"],
             "completedCases": row["completed_cases"],
+            "appointment": {"at": row["appointment_at"], "place": row["appointment_place"]} if row["appointment_at"] else None,
+            "adminMessage": row["admin_message"],
+            "reviewedAt": row["reviewed_at"],
         }
     )
     return data
 
 
 ADVOCATE_SELECT = """
-SELECT u.*, ap.bar_council_id, ap.specialization,
+SELECT u.*, ap.bar_council_id, ap.specialization, ap.verification_status AS advocate_status,
+       ap.appointment_at, ap.appointment_place, ap.admin_message, ap.reviewed_at,
        (SELECT COUNT(*) FROM verification_requests vr WHERE vr.advocate_id = u.id AND vr.status = 'in_review') AS active_cases,
        (SELECT COUNT(*) FROM verification_requests vr WHERE vr.advocate_id = u.id
           AND vr.status IN ('document_verified', 'issue_found')) AS completed_cases
@@ -1142,36 +1281,83 @@ def list_advocates(request):
 @router.route("POST", "/api/admin/advocates")
 def add_advocate(request):
     admin = request.require("admin")
-    checker = Checker(request.json())
-    checker.text("fullName", "Full name", min_length=2, max_length=80)
-    check_email(checker)
-    check_phone(checker)
-    check_new_password(checker)
-    checker.text("barCouncilId", "Bar Council ID", min_length=3, max_length=40)
-    checker.text("specialization", "Specialization", min_length=2, max_length=80)
-    data = checker.done()
-
+    data = check_advocate_fields(Checker(request.json()))
     connection = request.connection
-    conflicts = {}
-    if connection.execute("SELECT 1 FROM users WHERE email = ?", (data["email"],)).fetchone():
-        conflicts["email"] = "An account with this email already exists."
-    if connection.execute("SELECT 1 FROM advocate_profiles WHERE bar_council_id = ?", (data["barCouncilId"],)).fetchone():
-        conflicts["barCouncilId"] = "This Bar Council ID is already registered."
-    if conflicts:
-        raise ApiError(409, "Please fix the highlighted fields.", conflicts)
-    now = utc_now()
-    cursor = connection.execute(
-        """INSERT INTO users (full_name, email, phone, password_hash, role, created_at)
-           VALUES (?, ?, ?, ?, 'advocate', ?)""",
-        (data["fullName"], data["email"], data["phone"], hash_password(data["password"]), now),
-    )
+    # The admin has already checked this advocate, so the account is verified from the start.
+    advocate_id = create_advocate(connection, data, "verified", added_by=admin["id"])
+    audit(connection, admin["id"], "advocate_added", "user", advocate_id, None, "active", data["fullName"])
+    return Response(201, {"advocate": advocate_json(load_advocate(connection, advocate_id))})
+
+
+BANGLADESH_TIME = timezone(timedelta(hours=6))
+APPOINTMENT_MAX_DAYS = 90
+
+
+@router.route("POST", "/api/admin/advocates/{id}/appointment")
+def send_advocate_appointment(request):
+    """Invite an advocate who applied to come in person. Sending again replaces the earlier appointment."""
+    admin = request.require("admin")
+    connection = request.connection
+    row = load_advocate(connection, request.params["id"])
+    if row["advocate_status"] == "verified":
+        raise ApiError(409, "This advocate is already verified.")
+    data = request.json()
+    checker = Checker(data)
+    checker.text("place", "Place", min_length=5, max_length=160)
+    checker.text("message", "Message", max_length=500, required=False)
+    when = None
+    try:
+        when = datetime.strptime(str(data.get("appointmentAt", "")), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        checker.fail("appointmentAt", "Choose the appointment date and time.")
+    else:
+        now = datetime.now(BANGLADESH_TIME).replace(tzinfo=None)
+        if when <= now:
+            checker.fail("appointmentAt", "The appointment must be in the future.")
+        elif when > now + timedelta(days=APPOINTMENT_MAX_DAYS):
+            checker.fail("appointmentAt", f"The appointment must be within the next {APPOINTMENT_MAX_DAYS} days.")
+    cleaned = checker.done()
+    appointment_at = when.strftime("%Y-%m-%dT%H:%M")
     connection.execute(
-        """INSERT INTO advocate_profiles (user_id, bar_council_id, specialization, added_by, added_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (cursor.lastrowid, data["barCouncilId"], data["specialization"], admin["id"], now),
+        """UPDATE advocate_profiles SET verification_status = 'appointment_sent', appointment_at = ?, appointment_place = ?,
+               admin_message = ?, reviewed_by = ?, reviewed_at = ? WHERE user_id = ?""",
+        (appointment_at, cleaned["place"], cleaned["message"] or None, admin["id"], utc_now(), row["id"]),
     )
-    audit(connection, admin["id"], "advocate_added", "user", cursor.lastrowid, None, "active", data["fullName"])
-    return Response(201, {"advocate": advocate_json(load_advocate(connection, cursor.lastrowid))})
+    audit(connection, admin["id"], "advocate_appointment_sent", "user", row["id"], row["advocate_status"], "appointment_sent",
+          f"{row['full_name']}: {appointment_at.replace('T', ' ')} at {cleaned['place']}")
+    notify(connection, row["id"], "advocate_account", "You have an appointment",
+           f"{consult.nice_time(appointment_at)}, {cleaned['place']}", "/advocate/application")
+    return {"advocate": advocate_json(load_advocate(connection, row["id"]))}
+
+
+@router.route("POST", "/api/admin/advocates/{id}/verification")
+def decide_advocate(request):
+    """Verify an advocate after the in-person meeting, or reject the application."""
+    admin = request.require("admin")
+    connection = request.connection
+    row = load_advocate(connection, request.params["id"])
+    if row["advocate_status"] == "verified":
+        raise ApiError(409, "This advocate is already verified.")
+    checker = Checker(request.json())
+    decision = checker.choice("decision", "Decision", ("verified", "rejected"))
+    note = checker.text("note", "Reason", min_length=5, max_length=500, required=decision == "rejected")
+    checker.done()
+    if decision == "verified" and row["advocate_status"] != "appointment_sent":
+        raise ApiError(409, "Send an appointment and meet the advocate in person before verifying them.")
+    if decision == row["advocate_status"]:
+        raise ApiError(409, "This application is already rejected.")
+    connection.execute(
+        "UPDATE advocate_profiles SET verification_status = ?, admin_message = ?, reviewed_by = ?, reviewed_at = ? WHERE user_id = ?",
+        (decision, note or None, admin["id"], utc_now(), row["id"]),
+    )
+    audit(connection, admin["id"], "advocate_verification_changed", "user", row["id"], row["advocate_status"], decision,
+          f"{row['full_name']}: {note}" if note else row["full_name"])
+    if decision == "verified":
+        notify(connection, row["id"], "advocate_account", "Your advocate account is verified",
+               "You can now open the verification queue and answer consultations.", "/advocate")
+    else:
+        notify(connection, row["id"], "advocate_account", "Your application was not approved", note or "", "/advocate/application")
+    return {"advocate": advocate_json(load_advocate(connection, row["id"]))}
 
 
 @router.route("POST", "/api/admin/advocates/{id}/status")
@@ -1275,3 +1461,7 @@ def admin_audit_log(request):
     sql = AUDIT_SELECT + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY a.id DESC LIMIT ?"
     rows = request.connection.execute(sql, (*params, limit)).fetchall()
     return {"entries": [audit_json(row) for row in rows]}
+
+
+# Sprint 3 routes register themselves on the router above. Imported last because consult.py uses the helpers here.
+from . import consult, sprint4  # noqa: E402, F401
