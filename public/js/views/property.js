@@ -108,8 +108,9 @@ export async function render({ root, params, query, session }) {
           <li><small>Furnished</small><strong>${property.furnished ? 'Yes' : 'No'}</strong></li>
           <li><small>Listed</small><strong>${formatDate(property.createdAt)}</strong></li>
         </ul>
-        <h2>About this home</h2>
-        <p>${property.description}</p>
+        ${property.description ? html`
+          <h2>About this home</h2>
+          <p>${property.description}</p>` : ''}
         <p class="muted small">Listed by ${property.owner.name}</p>
       </div>
       <aside class="stack">

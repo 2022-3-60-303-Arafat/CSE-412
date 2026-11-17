@@ -84,7 +84,7 @@ This gives the site a free address, `https://YOURNAME.pythonanywhere.com`, that 
 6. **Start it.** Click the green **Reload** button at the top of the Web tab, then open `https://YOURNAME.pythonanywhere.com`.
 
 Good to know:
-- **Keep it alive:** on the free plan, log in once every 3 months and click **Run until 3 months from today** on the Web tab, or the site is paused.
+- **Keep it alive:** on the free plan, log in at least once a month and click the **Run until ...** extend button on the Web tab, or the site is paused. (Since January 2026 free web apps expire after 1 month, not 3.)
 - **Updating the site:** upload the changed files (or a new zip), then click **Reload** on the Web tab. Your database is kept unless you run `--reset` again.
 - **If something goes wrong:** the **Error log** link on the Web tab shows what happened.
 - **Custom domain:** the free plan only allows the `pythonanywhere.com` address. A custom domain such as `pfb.com.bd` needs a paid plan and a bought domain.
@@ -96,7 +96,7 @@ Good to know:
 python -m unittest discover -s tests -v
 ```
 
-There are 31 automated tests: at least one per story's acceptance criteria, 5 for browsing history and 2 for the hosted version. Set `PFB_TEST_WSGI=1` to run all of them against the hosted (WSGI) version. Each test starts its own server on a temporary database, so your demo data is never touched.
+There are 32 automated tests: at least one per story's acceptance criteria, 5 for browsing history and 2 for the hosted version. Set `PFB_TEST_WSGI=1` to run all of them against the hosted (WSGI) version. Each test starts its own server on a temporary database, so your demo data is never touched.
 
 ## Where each story is done
 

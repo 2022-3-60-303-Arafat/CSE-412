@@ -254,6 +254,23 @@ class Sprint1Tests(ApiTestCase):
         self.assertEqual(status, 409)
         self.assertIn("barCouncilId", body["fields"])
 
+    def test_pb05_description_is_optional(self):
+        owner = self.client("owner@pfb.test")
+        for description in (None, "", "   "):
+            listing = rent_listing(description=description)
+            if description is None:
+                del listing["description"]
+            status, body = owner.post("/api/properties", listing)
+            self.assertEqual(status, 201, body)
+            self.assertEqual(body["property"]["description"], "")
+        listing_id = body["property"]["id"]
+        status, body = owner.put(f"/api/properties/{listing_id}", rent_listing(description="Short note"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["property"]["description"], "Short note")
+        status, body = owner.post("/api/properties", rent_listing(description="x" * 2001))
+        self.assertEqual(status, 400)
+        self.assertIn("description", body["fields"])
+
     def test_pb05_pb06_pb09_rent_listing_saved_live_and_unverified(self):
         owner = self.client("owner@pfb.test")
         status, body = owner.post("/api/properties", rent_listing())

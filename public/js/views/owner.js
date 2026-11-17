@@ -180,7 +180,7 @@ export async function renderForm({ root, params, session, navigate }) {
 
       <fieldset class="form-section">
         <legend>Description</legend>
-        <label class="field"><span>Describe the home <span class="hint">at least 20 characters</span></span>
+        <label class="field"><span>Describe the home <span class="hint">optional</span></span>
           <textarea name="description" maxlength="2000">${p.description || ''}</textarea></label>
       </fieldset>
 

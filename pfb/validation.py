@@ -164,7 +164,7 @@ def clean_listing(data, existing_available_from=None):
     """Validate the owner listing form (PB-05). Returns cleaned values and rent details."""
     checker = Checker(data)
     checker.text("title", "Title", min_length=5, max_length=100)
-    checker.text("description", "Description", min_length=20, max_length=2000)
+    checker.text("description", "Description", max_length=2000, required=False)
     listing_type = checker.choice("listingType", "Listing type (Sale or Rent)", ("sale", "rent"))
     property_type = checker.choice("propertyType", "Property type", PROPERTY_TYPES)
     checker.text("areaName", "Area", min_length=2, max_length=60)
